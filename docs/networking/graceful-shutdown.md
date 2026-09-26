@@ -41,14 +41,20 @@ periodically reload certificates and OPA policies on a fixed interval.
 
 *Available since v1.8.1.*
 
-If `--enable-shutdown` is set (requires `--status`), you can trigger a
-shutdown via HTTP POST:
+If `--enable-shutdown` is set (requires a TLS `--status` listener), you can
+trigger a shutdown via HTTP POST with a client certificate that verifies
+against the trust store:
 
 ```bash
-curl -X POST --cacert test-keys/cacert.pem https://localhost:6060/_shutdown
+curl -X POST --cacert test-keys/cacert.pem \
+    --cert test-keys/client-cert.pem --key test-keys/client-key.pem \
+    https://localhost:6060/_shutdown
 ```
 
-Any HTTP method other than POST returns 405 Method Not Allowed.
+Any HTTP method other than POST returns 405 Method Not Allowed. A request
+without a verified client certificate returns 403 Forbidden, and Ghostunnel
+refuses to start with `--enable-shutdown` if the status port would serve
+plain HTTP.
 
 ## Shutdown Sequence
 
@@ -74,8 +80,8 @@ When a shutdown is triggered, the following happens in order:
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--shutdown-timeout` | `5m` | Maximum time to wait for in-flight connections to drain. If connections are still open after this duration, the process force-exits with code 1. |
-| `--enable-shutdown` | `false` | Enable the `/_shutdown` HTTP endpoint on the status port. Requires `--status`. |
-| `--status` | *(none)* | `[http(s)://]HOST:PORT`, `unix:PATH`, `systemd:NAME`, or `launchd:NAME` for the status listener. Required for `/_shutdown`. |
+| `--enable-shutdown` | `false` | Enable the `/_shutdown` HTTP endpoint on the status port. Requires a TLS `--status` listener; callers must present a client certificate that verifies against the trust store. |
+| `--status` | *(none)* | `[http(s)://]HOST:PORT`, `unix:PATH`, `systemd:NAME`, or `launchd:NAME` for the status listener. Required for `/_shutdown`, which is only served over HTTPS on a `HOST:PORT` listener. |
 
 See [Command-Line Flags]({{< ref "flags.md" >}}) for the full flag reference.
 

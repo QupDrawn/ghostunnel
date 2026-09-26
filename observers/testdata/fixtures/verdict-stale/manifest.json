@@ -1,0 +1,84 @@
+{
+    "fixture": "verdict-stale",
+    "description": "admin stopped writing after sequence 42 with no stop marker (a death). The reader's two most recent heartbeats both recorded admin's 42, which meets STALE_AFTER (ceil(10/10) + slack 1 = 2). Stale; member-fresh fails.",
+    "rules": [
+        "SPEC 8",
+        "SPEC 8.1 V6"
+    ],
+    "reader": "tunnel",
+    "reader_booted": false,
+    "parameters": {
+        "window": 4,
+        "stale_slack_cycles": 1,
+        "staging_stale_after_seconds": 60,
+        "max_heartbeat_bytes": 8192,
+        "max_fault_bytes": 8192,
+        "max_halt_bytes": 8192,
+        "now": "2026-09-20T10:07:25Z"
+    },
+    "directories": [
+        "stores/admin",
+        "stores/admin/copy",
+        "stores/admin/copy-super",
+        "stores/admin/copy-super/heartbeat",
+        "stores/admin/copy/heartbeat",
+        "stores/admin/halts",
+        "stores/admin/heartbeat",
+        "stores/material",
+        "stores/material/copy",
+        "stores/material/copy-super",
+        "stores/material/copy-super/heartbeat",
+        "stores/material/copy/heartbeat",
+        "stores/material/halts",
+        "stores/material/heartbeat",
+        "stores/super",
+        "stores/super/copy-admin",
+        "stores/super/copy-admin/heartbeat",
+        "stores/super/copy-material",
+        "stores/super/copy-material/heartbeat",
+        "stores/super/copy-tunnel",
+        "stores/super/copy-tunnel/heartbeat",
+        "stores/super/halts",
+        "stores/super/heartbeat",
+        "stores/tunnel",
+        "stores/tunnel/copy",
+        "stores/tunnel/copy-super",
+        "stores/tunnel/copy-super/heartbeat",
+        "stores/tunnel/copy/heartbeat",
+        "stores/tunnel/halts",
+        "stores/tunnel/heartbeat"
+    ],
+    "expect": {
+        "verdicts": {
+            "admin": "stale",
+            "material": "alive",
+            "super": "alive"
+        },
+        "failing": [
+            {
+                "check": "member-fresh",
+                "subject": "admin"
+            }
+        ],
+        "halt_in_force_before": false,
+        "halt": {
+            "writes": true,
+            "reason": "member-fresh",
+            "subject": "admin"
+        },
+        "publish": {
+            "sequence": 45,
+            "previous": "1b7df12e35dcb1babd552e211dfdbf1fa90451c3d2a26ebdd28e451017c22f71",
+            "observed": {
+                "admin": "b985843d16f7902afecbe6200d3c15220f04d6943d1aed66328527cf3a009fe2",
+                "material": "48d468468515dc494597fa2e3d02e58f2dfd8e345a484e0b31cece3af2c084fb",
+                "super": "278dc77a544ed85c729513ce76f5e542a90699428399cbf34301166731f2b75e"
+            },
+            "boot": null,
+            "stop": false
+        }
+    },
+    "unchanged": {
+        "admin": 25
+    }
+}

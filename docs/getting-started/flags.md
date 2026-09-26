@@ -66,6 +66,10 @@ See [HSM/PKCS#11]({{< ref "hsm-pkcs11.md" >}}).
 | `--close-timeout DURATION` | `60s` | Timeout for closing connections when one side terminates. Zero means immediate closure. Default raised from `1s` to `60s` in v1.11.1. |
 | `--max-conn-lifetime DURATION` | `0s` | Maximum lifetime for connections post handshake. Zero means infinite. |
 | `--max-concurrent-conns N` | `0` | Maximum number of concurrent connections. Zero means infinite. |
+| `--copy-buffer-size BYTES` | `0` | Size of each buffer the proxy forwards data with, one per direction per connection; memory for speed. Zero means the built-in default (64KiB). |
+| `--socket-buffer-size BYTES` | `0` | Kernel send and receive buffer size (`SO_SNDBUF`/`SO_RCVBUF`) for client and backend sockets. Zero leaves the OS default; Linux autotunes and an explicit size disables that. |
+| `--warm-backend-connections N` | `-1` (automatic) | Keep this many pre-dialed connections to the backend open and idle, taken instead of dialing per connection and refilled in the background. Zero dials per connection. The default chooses: 64 for a server-mode target that is not loopback or a UNIX socket, none otherwise. |
+| `--warm-backend-idle DURATION` | `30s` | Close and replace a pre-dialed backend connection idle for longer than this. |
 
 ### Metrics
 
@@ -86,21 +90,50 @@ metrics endpoints, and profiling.
 | Flag | Description | Availability |
 |------|-------------|--------------|
 | `--status ADDR` | Enable `/_status` and `/_metrics` on given `[http(s)://]HOST:PORT`, `unix:PATH`, `systemd:NAME`, or `launchd:NAME`. | All platforms |
-| `--enable-pprof` | Enable `/debug/pprof` endpoints alongside `/_status` (for profiling). Requires `--status`. | All platforms |
-| `--enable-shutdown` | Enable `/_shutdown` endpoint alongside `/_status` to allow terminating via HTTP POST. Requires `--status`. | All platforms |
+| `--enable-pprof` | Enable `/debug/pprof` endpoints alongside `/_status` (for profiling). Requires a TLS `--status` listener; every profiling endpoint acts only for a request that presents a client certificate that verifies against the trust store (403 otherwise), and `/debug/pprof/cmdline` is served with every argument value redacted. | All platforms |
+| `--enable-shutdown` | Enable `/_shutdown` endpoint alongside `/_status` to allow terminating via HTTP POST. Requires a TLS `--status` listener; the request must present a client certificate that verifies against the trust store **and** that the tunnel's own access-control rule (the `--allow-*` flags or OPA policy) allows. In client mode, or with `--disable-authentication`, there is no such rule and `/_shutdown` refuses every caller. | All platforms |
 | `--quiet` | Silence log messages. Values: `all`, `conns`, `conn-errs`, `handshake-errs`. Can be repeated. | All platforms |
 | `--syslog` | Send logs to syslog instead of stdout. | Unix (Linux, macOS, BSDs) |
 | `--eventlog` | Send logs to Windows Event Log instead of stdout. | Windows |
 | `--skip-resolve` | Skip resolving target host on startup (useful to start before network is up). | All platforms |
 
-### Landlock
+### Process sandbox (Landlock)
 
 See [Security & TLS Configuration]({{< ref "general.md" >}}) for details on
-Landlock sandboxing.
+Landlock sandboxing. Ghostunnel attempts the platform's process sandbox at
+startup on every platform (Landlock is the facility on Linux) and records
+the outcome in the observer ring's start line as `sandbox_state`:
+`applied`, `disabled`, `failed`, `skipped`, or `unsupported` on a build that
+has no sandbox facility at all (every non-Linux build today). This fork
+serves only sandboxed: where a facility exists, only `applied` starts, and
+`disabled`, `failed` and `skipped` refuse to start with a message naming the
+state. A build with no sandbox facility does not start unless the operator
+accepts that explicitly by naming the OS; the acceptance is recorded in the
+start line as `sandbox_accepted`, and it is refused on any build that has a
+sandbox facility, so it stops working the moment the platform gains one. See `observers/README.md`.
 
 | Flag | Description | Availability |
 |------|-------------|--------------|
-| `--disable-landlock` | Disable the best-effort Landlock sandboxing. Landlock is automatically disabled when PKCS#11 is used. | Linux only |
+| `--disable-landlock` | Still parsed, but unusable in this fork: it sets `sandbox_state` to `disabled`, and Ghostunnel refuses to start on any state other than `applied` where a sandbox facility exists. PKCS#11 is unusable for the same reason: Landlock is not applied alongside it (`skipped`). A Linux kernel without Landlock, or one that does not enforce it, gives `failed` and refuses the same way. | Linux only |
+| `--accept-no-sandbox OS` | Run on a build that has no process sandbox facility, naming this OS as Go names it (`windows`, `darwin`, ...). Required on every such build; Ghostunnel refuses to start without it, and refuses to start when the value is not exactly this OS or when the build has a sandbox facility (Linux, whatever the sandbox's state). Recorded as `sandbox_accepted` in the start line. | All platforms; accepted only where no sandbox facility exists |
+
+### Observer Ring
+
+Ghostunnel in this fork does not run without its observer ring
+(`observers/README.md`; the trace format and the gate's refuse conditions
+are in `ringtrace/README.md`). The trace is always written and the gate is
+consulted on every accept; there is no flag that turns either off, and an
+empty value for a directory flag is refused. On a fresh ring Ghostunnel
+starts, refuses every connection until the coordinator's heartbeat is fresh
+and no halt or fault is in force, then serves; there is no grace period.
+See `observers/README.md`.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--ring-traces DIR` | `/var/lib/ghostunnel-ring/stores/gt` | Directory the trace of every accept, handshake, access decision, reload and shutdown request is appended under (the ring's `gt/` root). The start line records the configuration as served. If the trace cannot be opened Ghostunnel refuses to start; if an event later cannot be recorded, every further connection is refused and `/_status` answers 503 until restart. |
+| `--ring-stores DIR` | `/var/lib/ghostunnel-ring/stores` | Root of the observers' store tree, consulted on every accept. A connection is served only if no observer holds a halt or fault and the coordinator's newest heartbeat is current; otherwise it is closed, the reason is logged, and `/_status` answers 503 while the refusal lasts. |
+| `--ring-heartbeat-max-age DURATION` | none, **required** | How old the coordinator's newest heartbeat may be, in either direction, before connections are refused. Must be given explicitly and must exceed the coordinator's cadence; Ghostunnel refuses to start without it. |
+| `--ring-tick DURATION` | `5s` | How often a `tick` line, the trace's own heartbeat, is written, so the observers can tell a dead trace from a quiet one. Must be above zero, below `--ring-heartbeat-max-age` and below the observers' cadence; Ghostunnel refuses to start otherwise. |
 
 ## Server Mode Flags
 
@@ -194,8 +227,16 @@ for `systemd:NAME` and `launchd:NAME` addresses.
 
 See [Access Control Flags]({{< ref "access-flags.md" >}}).
 
+Client mode does not fall back to hostname-only verification silently: it
+refuses to start unless at least one `--verify-*` rule (subject, SAN, pin or
+OPA) is given, or the operator passes `--verify-hostname-only` to accept
+verification by the trust store and the server name alone. The rule in force
+is recorded in the observer ring's start line as `acl` (for hostname-only
+verification, exactly `["verify-hostname"]`). See `observers/README.md`.
+
 | Flag | Description |
 |------|-------------|
+| `--verify-hostname-only` | Verify the server by its hostname alone (the trust store and the server name), with no `--verify-*` rule. Required when no `--verify-*` rule is given; refused beside any `--verify-*` rule. |
 | `--verify-cn CN` | Allow servers with given common name (repeatable). |
 | `--verify-ou OU` | Allow servers with given organizational unit name (repeatable). |
 | `--verify-dns DNS` | Allow servers with given DNS subject alternative name (repeatable). |

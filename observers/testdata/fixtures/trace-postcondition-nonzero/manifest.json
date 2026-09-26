@@ -1,0 +1,99 @@
+{
+    "fixture": "trace-postcondition-nonzero",
+    "description": "The trace is fresh, complete and covers everything, and the database (answers supplied by the manifest) still holds three expired tokens older than the widened window. The trace says the work was done; the database says it was not. postcondition fails for expire-tokens.",
+    "rules": [
+        "SPEC 14.2 T4"
+    ],
+    "reader": "tunnel",
+    "reader_booted": false,
+    "parameters": {
+        "window": 4,
+        "stale_slack_cycles": 1,
+        "staging_stale_after_seconds": 60,
+        "max_heartbeat_bytes": 8192,
+        "max_fault_bytes": 8192,
+        "max_halt_bytes": 8192,
+        "now": "2026-09-20T10:07:25Z"
+    },
+    "directories": [
+        "stores/admin",
+        "stores/admin/copy",
+        "stores/admin/copy-super",
+        "stores/admin/copy-super/heartbeat",
+        "stores/admin/copy/heartbeat",
+        "stores/admin/halts",
+        "stores/admin/heartbeat",
+        "stores/material",
+        "stores/material/copy",
+        "stores/material/copy-super",
+        "stores/material/copy-super/heartbeat",
+        "stores/material/copy/heartbeat",
+        "stores/material/halts",
+        "stores/material/heartbeat",
+        "stores/super",
+        "stores/super/copy-admin",
+        "stores/super/copy-admin/heartbeat",
+        "stores/super/copy-material",
+        "stores/super/copy-material/heartbeat",
+        "stores/super/copy-tunnel",
+        "stores/super/copy-tunnel/heartbeat",
+        "stores/super/halts",
+        "stores/super/heartbeat",
+        "stores/tunnel",
+        "stores/tunnel/copy",
+        "stores/tunnel/copy-super",
+        "stores/tunnel/copy-super/heartbeat",
+        "stores/tunnel/copy/heartbeat",
+        "stores/tunnel/halts",
+        "stores/tunnel/heartbeat",
+        "traces/daily"
+    ],
+    "traces": [
+        {
+            "schedule": "daily",
+            "period_seconds": 86400,
+            "margin_seconds": 600,
+            "deadline_seconds": 3600,
+            "declared": [
+                "prune-metrics",
+                "reset-daily-counters",
+                "reset-counters",
+                "expire-leases",
+                "expire-tokens",
+                "expire-transfers",
+                "expire-pending-changes",
+                "truncate-daily-log",
+                "rollover:new-day"
+            ]
+        }
+    ],
+    "db": {
+        "expire-tokens": 3,
+        "expire-pending-changes": 0,
+        "expire-transfers": 0,
+        "expire-leases": 0,
+        "prune-messages": 0,
+        "prune-uploads": 0,
+        "prune-backups": 0,
+        "truncate-daily-log": 0
+    },
+    "expect": {
+        "verdicts": {
+            "admin": "alive",
+            "material": "alive",
+            "super": "alive"
+        },
+        "failing": [
+            {
+                "check": "postcondition",
+                "subject": "expire-tokens"
+            }
+        ],
+        "halt_in_force_before": false,
+        "halt": {
+            "writes": true,
+            "reason": "postcondition",
+            "subject": "expire-tokens"
+        }
+    }
+}

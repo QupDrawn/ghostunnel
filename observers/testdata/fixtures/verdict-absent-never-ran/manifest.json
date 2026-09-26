@@ -1,0 +1,79 @@
+{
+    "fixture": "verdict-absent-never-ran",
+    "description": "material's store root exists with no heartbeat folder and the reader has never observed it (basis null). Absent, a fault, not I4.",
+    "rules": [
+        "SPEC 8.1 V2"
+    ],
+    "reader": "tunnel",
+    "reader_booted": false,
+    "parameters": {
+        "window": 4,
+        "stale_slack_cycles": 1,
+        "staging_stale_after_seconds": 60,
+        "max_heartbeat_bytes": 8192,
+        "max_fault_bytes": 8192,
+        "max_halt_bytes": 8192,
+        "now": "2026-09-20T10:07:25Z"
+    },
+    "directories": [
+        "stores/admin",
+        "stores/admin/copy",
+        "stores/admin/copy-super",
+        "stores/admin/copy-super/heartbeat",
+        "stores/admin/copy/heartbeat",
+        "stores/admin/halts",
+        "stores/admin/heartbeat",
+        "stores/material",
+        "stores/material/copy",
+        "stores/material/copy-super",
+        "stores/material/copy-super/heartbeat",
+        "stores/material/copy/heartbeat",
+        "stores/material/halts",
+        "stores/super",
+        "stores/super/copy-admin",
+        "stores/super/copy-admin/heartbeat",
+        "stores/super/copy-material",
+        "stores/super/copy-material/heartbeat",
+        "stores/super/copy-tunnel",
+        "stores/super/copy-tunnel/heartbeat",
+        "stores/super/halts",
+        "stores/super/heartbeat",
+        "stores/tunnel",
+        "stores/tunnel/copy",
+        "stores/tunnel/copy-super",
+        "stores/tunnel/copy-super/heartbeat",
+        "stores/tunnel/copy/heartbeat",
+        "stores/tunnel/halts",
+        "stores/tunnel/heartbeat"
+    ],
+    "expect": {
+        "verdicts": {
+            "admin": "alive",
+            "material": "absent",
+            "super": "alive"
+        },
+        "failing": [
+            {
+                "check": "member-present",
+                "subject": "material"
+            }
+        ],
+        "halt_in_force_before": false,
+        "halt": {
+            "writes": true,
+            "reason": "member-present",
+            "subject": "material"
+        },
+        "publish": {
+            "sequence": 45,
+            "previous": "ece66175fc8949de2f275d24159c62f0530c8fbe79a18a6b87f50a084268c7e1",
+            "observed": {
+                "admin": "7d7417531d70c49387ce111870114c530e6a020f313cd7f0bfb90e652ccd5d41",
+                "material": null,
+                "super": "7b3bb10168270cd97857a21dce65134787215173302cfb77399dfb99bbdf4d2f"
+            },
+            "boot": null,
+            "stop": false
+        }
+    }
+}

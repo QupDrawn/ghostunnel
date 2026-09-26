@@ -1,0 +1,84 @@
+{
+    "fixture": "benign-dead-member-old-account",
+    "description": "admin died after 40; its last heartbeat's account of the others points at entries they have since pruned. admin is stale (a fault) and, because its account is not current, it is not judged under I1(b). A death must not fire a compromise.",
+    "rules": [
+        "SPEC 11.1 I1(b)",
+        "SPEC 11.1 I1(b)"
+    ],
+    "reader": "tunnel",
+    "reader_booted": false,
+    "parameters": {
+        "window": 4,
+        "stale_slack_cycles": 1,
+        "staging_stale_after_seconds": 60,
+        "max_heartbeat_bytes": 8192,
+        "max_fault_bytes": 8192,
+        "max_halt_bytes": 8192,
+        "now": "2026-09-20T10:07:25Z"
+    },
+    "directories": [
+        "stores/admin",
+        "stores/admin/copy",
+        "stores/admin/copy-super",
+        "stores/admin/copy-super/heartbeat",
+        "stores/admin/copy/heartbeat",
+        "stores/admin/halts",
+        "stores/admin/heartbeat",
+        "stores/material",
+        "stores/material/copy",
+        "stores/material/copy-super",
+        "stores/material/copy-super/heartbeat",
+        "stores/material/copy/heartbeat",
+        "stores/material/halts",
+        "stores/material/heartbeat",
+        "stores/super",
+        "stores/super/copy-admin",
+        "stores/super/copy-admin/heartbeat",
+        "stores/super/copy-material",
+        "stores/super/copy-material/heartbeat",
+        "stores/super/copy-tunnel",
+        "stores/super/copy-tunnel/heartbeat",
+        "stores/super/halts",
+        "stores/super/heartbeat",
+        "stores/tunnel",
+        "stores/tunnel/copy",
+        "stores/tunnel/copy-super",
+        "stores/tunnel/copy-super/heartbeat",
+        "stores/tunnel/copy/heartbeat",
+        "stores/tunnel/halts",
+        "stores/tunnel/heartbeat"
+    ],
+    "expect": {
+        "verdicts": {
+            "admin": "stale",
+            "material": "alive",
+            "super": "alive"
+        },
+        "failing": [
+            {
+                "check": "member-fresh",
+                "subject": "admin"
+            }
+        ],
+        "halt_in_force_before": false,
+        "halt": {
+            "writes": true,
+            "reason": "member-fresh",
+            "subject": "admin"
+        },
+        "publish": {
+            "sequence": 45,
+            "previous": "3c18d39ffb5f6eb75e97c531e1f97552d8674de0b6a897e175c8811e6abd5367",
+            "observed": {
+                "admin": "a7080d2790c8d25fabaf137b85aa9b18aa9365e64ca61ab8e60fb001c3b33327",
+                "material": "fd99305617dd5452bfccd159cd4181075738360655c76e39619e962a9ddb6ca0",
+                "super": "955dcaf2c5d85e937eae424eddc2c46d854e3ab421d011ffa8fd85c948670b52"
+            },
+            "boot": null,
+            "stop": false
+        }
+    },
+    "unchanged": {
+        "admin": 25
+    }
+}

@@ -36,6 +36,7 @@ import (
 	"github.com/ghostunnel/ghostunnel/certloader"
 	"github.com/ghostunnel/ghostunnel/policy"
 	"github.com/ghostunnel/ghostunnel/proxy"
+	"github.com/ghostunnel/ghostunnel/ringtrace"
 	"github.com/ghostunnel/ghostunnel/socket"
 	"github.com/ghostunnel/ghostunnel/wildcard"
 
@@ -120,6 +121,10 @@ var (
 	clientAllowPolicy    = clientCommand.Flag("verify-policy", "Allow passing the location of an OPA bundle.").PlaceHolder("BUNDLE").String()
 	clientAllowQuery     = clientCommand.Flag("verify-query", "Rego query to evaluate against the server certificate and the policy.").PlaceHolder("QUERY").String()
 	clientDisableAuth    = clientCommand.Flag("disable-authentication", "Disable client authentication, no certificate will be provided to the server.").Default("false").Bool()
+	// clientVerifyHostnameOnly is the operator's explicit statement that the
+	// server is verified by its hostname alone (crypto/tls) and no --verify-*
+	// rule is wanted; without it, client mode does not start without a rule.
+	clientVerifyHostnameOnly = clientCommand.Flag("verify-hostname-only", "Verify the server by its hostname alone (the trust store and the server name), with no --verify-* rule. Client mode refuses to start without either this flag or at least one --verify-* rule; the flag is refused beside any --verify-* rule.").Default("false").Bool()
 
 	// TLS options
 	keystorePath          = app.Flag("keystore", "Path to keystore (combined PEM with cert/key, or PKCS12 keystore).").PlaceHolder("PATH").Envar("KEYSTORE_PATH").String()
@@ -144,6 +149,10 @@ var (
 	closeTimeout           = app.Flag("close-timeout", "Timeout for closing connections when one side terminates. Zero means immediate closure.").Default("60s").Duration()
 	maxConnLifetime        = app.Flag("max-conn-lifetime", "Maximum lifetime for connections post handshake, no matter what. Zero means infinite.").Default("0s").Duration()
 	maxConcurrentConns     = app.Flag("max-concurrent-conns", "Maximum number of concurrent connections to handle in the proxy. Zero means infinite.").Default("0").Uint32()
+	copyBufferSize         = app.Flag("copy-buffer-size", "Size of each buffer the proxy forwards data with, one per direction per connection; memory for speed. Zero means the built-in default (64KiB).").Default("0").Bytes()
+	socketBufferSize       = app.Flag("socket-buffer-size", "Kernel send and receive buffer size (SO_SNDBUF/SO_RCVBUF) for client and backend sockets. Zero (the default) leaves the OS default; Linux autotunes and an explicit size disables that.").Default("0").Bytes()
+	warmBackendConnections = app.Flag("warm-backend-connections", "Keep this many pre-dialed connections to the backend open and idle, taken instead of dialing per connection and refilled in the background. Zero dials per connection. The default, -1, chooses: 64 for a server-mode target that is not loopback or a UNIX socket (where the dial is a network round trip), none otherwise.").Default("-1").Int()
+	warmBackendIdle        = app.Flag("warm-backend-idle", "Close and replace a pre-dialed backend connection idle for longer than this.").Default("30s").Duration()
 
 	// Metrics options
 	metricsGraphite = app.Flag("metrics-graphite", "Collect metrics and report them to the given graphite instance (raw TCP).").PlaceHolder("ADDR").TCP()
@@ -154,9 +163,17 @@ var (
 	// Status, logging & other
 	statusAddress  = app.Flag("status", "Enable serving /_status and /_metrics on given [http(s)://]HOST:PORT, unix:PATH, systemd:NAME or launchd:NAME.").PlaceHolder("ADDR").String()
 	enableProf     = app.Flag("enable-pprof", "Enable serving /debug/pprof endpoints alongside /_status (for profiling).").Bool()
-	enableShutdown = app.Flag("enable-shutdown", "Enable serving a /_shutdown endpoint alongside /_status to allow terminating via HTTP POST request.").Default("false").Bool()
+	enableShutdown = app.Flag("enable-shutdown", "Enable serving a /_shutdown endpoint alongside /_status to allow terminating via HTTP POST request. Requires a TLS status listener; the request must present a client certificate that verifies against the trust store.").Default("false").Bool()
 	quiet          = app.Flag("quiet", "Silence log messages (can be all, conns, conn-errs, handshake-errs; repeat flag for more than one)").Default("").Enums("", "all", "conns", "handshake-errs", "conn-errs")
 	skipResolve    = app.Flag("skip-resolve", "Skip resolving target host on startup (useful to start Ghostunnel before network is up).").Default("false").Bool()
+
+	// Observer ring (see ringtrace/README.md). Ghostunnel does not run
+	// without it: the trace is always written and the gate always consulted.
+	ringTraces          = app.Flag("ring-traces", "Directory the trace of every accept, handshake, access decision, reload and shutdown request is appended under (the observer ring's gt/ root). Ghostunnel refuses to start if it cannot be opened.").PlaceHolder("DIR").Default(ringtrace.DefaultRoot + "/gt").String()
+	ringStores          = app.Flag("ring-stores", "Root of the observer ring's store tree, consulted on every accept: a connection is served only if no observer holds a halt or fault and the coordinator's heartbeat is current; otherwise it is refused.").PlaceHolder("DIR").Default(ringtrace.DefaultRoot).String()
+	ringHeartbeatMaxAge = app.Flag("ring-heartbeat-max-age", "How old the observer ring coordinator's newest heartbeat may be before connections are refused. Required, no default; must exceed the coordinator's cadence.").PlaceHolder("DURATION").Duration()
+	ringTick            = app.Flag("ring-tick", "How often a tick line, the trace's own heartbeat, is written so the observers can tell a dead trace from a quiet one. Must be above zero, below the observers' cadence and below --ring-heartbeat-max-age.").PlaceHolder("DURATION").Default("5s").Duration()
+	acceptNoSandbox     = app.Flag("accept-no-sandbox", "Run on a build that has no process sandbox facility, naming this OS (as Go names it: windows, darwin, ...) as the one whose lack of a sandbox is accepted. Required on every such build and refused on any build that has a sandbox facility (Linux, whatever the sandbox's state) or when the value is not this OS. Recorded as sandbox_accepted in the observer ring's start line.").PlaceHolder("OS").String()
 
 	// Man page /help
 	_ = app.Flag("help-custom-man", "Generate a man page.").Hidden().PreAction(generateManPage).Bool()
@@ -216,6 +233,24 @@ var exitFunc = os.Exit //nolint:forbidigo // the one allowed os.Exit indirection
 // nolint directive.
 var extraRWPaths []string //nolint:unused
 
+// sandboxOutcome is the process sandbox's state as setupSandbox decided it
+// (one of ringtrace.SandboxStates), set once by run before any validation
+// and any listener; "" until then. sandboxState reads it: the start line is
+// filled from it and validateSandboxAcceptance is judged against it, so
+// the platform file that makes the attempt is the only place the state
+// comes from.
+var sandboxOutcome string
+
+// sandboxState is the process sandbox's state as decided at startup, or ""
+// while it is undecided, which every consumer refuses.
+func sandboxState() string {
+	return sandboxOutcome
+}
+
+// decideSandbox is the sandbox attempt run makes (a seam for tests, which
+// must not confine the test process to run the rest of the suite).
+var decideSandbox = setupSandbox
+
 // Environment groups listening context data together.
 type Environment struct {
 	status          *statusHandler
@@ -227,6 +262,41 @@ type Environment struct {
 	proxyMetrics    *proxy.Metrics
 	tlsConfigSource certloader.TLSConfigSource
 	regoPolicy      policy.Policy
+	// verifyCache remembers the tunnel ACL's peer verifications; reload()
+	// invalidates it after every reload of trust material and policy.
+	verifyCache *auth.VerifyCache
+	// ring is the observer ring's emitter and gate, set before the tunnel
+	// listener binds.
+	ring *ring
+	// proxy is the tunnel proxy, set by attachRing; statusListener is the
+	// status port's listener, set by serveStatus. The watchdog's health
+	// check reads the first; the second is what a failed Serve is about.
+	proxy          *proxy.Proxy
+	statusListener net.Listener
+}
+
+// acceptHealthWindow is how recently the accept loop must have come round
+// for the process to be healthy; the loop bounds every wait to one second,
+// so a healthy loop is never this far behind.
+var acceptHealthWindow = 5 * time.Second
+
+// healthy is the watchdog's health check: true only if the accept loop
+// came round within acceptHealthWindow, the proxy is not shutting down and
+// its listener is open, and the ring holds no sticky refusal (an emitter
+// that failed, a reload that failed, a status listener that died). A gate
+// refusal in force is not unhealthy: restarting into a halt changes
+// nothing. The service manager restarts the process when this is false for
+// its watchdog interval.
+func (env *Environment) healthy() bool {
+	p := env.proxy
+	if p == nil || p.ShuttingDown() || p.ListenerClosed() {
+		return false
+	}
+	last := p.LastIteration()
+	if last.IsZero() || time.Since(last) > acceptHealthWindow {
+		return false
+	}
+	return env.ring.stickyRefusal() == ""
 }
 
 // Global logger instance
@@ -303,6 +373,46 @@ func validateStatusAddress() error {
 		return fmt.Errorf("invalid --status network %q: http(s):// scheme requires a HOST:PORT target", network)
 	}
 	return nil
+}
+
+// defaultWarmBackendConnections is the pool a server-mode proxy keeps to a
+// backend that is not loopback or a UNIX socket when --warm-backend-connections
+// is left at its default. Against a remote backend the pool takes the dial
+// off every connection's path; 64 rather than 16 keeps the tail latency
+// down under concurrent load. The cost is that many idle connections held
+// open on the backend per proxy.
+const defaultWarmBackendConnections = 64
+
+// warmPoolSize resolves --warm-backend-connections: an explicit value (0 or
+// more) is taken as given; the default, -1, is defaultWarmBackendConnections
+// for a server-mode target the proxy considers remote (not loopback, not a
+// UNIX socket: consideredSafe), and none otherwise. On loopback the dial is
+// pure CPU and the pool adds bookkeeping under saturation; in client mode a
+// pooled connection's TLS handshake would be recorded at draw time rather
+// than when it happened, so the pool there is an explicit choice.
+func warmPoolSize(flag int, mode, target string) int {
+	if flag >= 0 {
+		return flag
+	}
+	if mode == "server" && !consideredSafe(target) {
+		return defaultWarmBackendConnections
+	}
+	return 0
+}
+
+// logWarmPool says what warmPoolSize decided and why, once at startup, so
+// the log shows the resolved value and not the flag's -1.
+func logWarmPool(n, flag int, mode, target string) {
+	switch {
+	case n == 0 && flag >= 0:
+		logger.Printf("warm backend pool: none (--warm-backend-connections 0)")
+	case n == 0:
+		logger.Printf("warm backend pool: none (automatic: %s mode, target %s is local or a UNIX socket, or client mode)", mode, target)
+	case flag >= 0:
+		logger.Printf("warm backend pool: %d connections (--warm-backend-connections %d)", n, flag)
+	default:
+		logger.Printf("warm backend pool: %d connections (automatic: %s mode, remote target %s)", n, mode, target)
+	}
 }
 
 // Validates that addr is "safe" and does not need --unsafe-listen (or --unsafe-target).
@@ -485,6 +595,12 @@ func serverValidateFlags() error {
 	if err := validateServerProxyProtocol(); err != nil {
 		return err
 	}
+	if err := validateRingFlags(); err != nil {
+		return err
+	}
+	if err := validateSandboxAcceptance(*acceptNoSandbox, runtime.GOOS, sandboxState()); err != nil {
+		return err
+	}
 	return validateCipherSuites()
 }
 
@@ -613,7 +729,39 @@ func clientValidateFlags() error {
 	if err := validateClientPin(); err != nil {
 		return err
 	}
+	if err := validateClientVerification(); err != nil {
+		return err
+	}
+	if err := validateRingFlags(); err != nil {
+		return err
+	}
+	if err := validateSandboxAcceptance(*acceptNoSandbox, runtime.GOOS, sandboxState()); err != nil {
+		return err
+	}
 	return validateCipherSuites()
+}
+
+// validateClientVerification refuses a client that would verify the server
+// by its hostname alone without the operator saying so: at least one
+// --verify-* rule (subject, SAN, pin or OPA) is required, or
+// --verify-hostname-only, which states that no rule beyond the hostname is
+// wanted and is refused beside any rule. The start line's acl then says
+// exactly which it is.
+func validateClientVerification() error {
+	hasRule := len(*clientAllowedCNs) > 0 ||
+		len(*clientAllowedOUs) > 0 ||
+		len(*clientAllowedDNSs) > 0 ||
+		len(*clientAllowedIPs) > 0 ||
+		len(*clientAllowedURIs) > 0 ||
+		len(*clientVerifySpkiPin) > 0 ||
+		*clientAllowPolicy != "" || *clientAllowQuery != ""
+	if *clientVerifyHostnameOnly && hasRule {
+		return errors.New("--verify-hostname-only is mutually exclusive with the --verify-* rules: it states that no rule beyond the hostname is wanted")
+	}
+	if !*clientVerifyHostnameOnly && !hasRule {
+		return errors.New("client mode verifies the server by its hostname alone unless a --verify-* rule is given: pass at least one of --verify-{cn,ou,dns,uri,spki-pin} or the OPA flags, or --verify-hostname-only to accept hostname-only verification explicitly")
+	}
+	return nil
 }
 
 // serverProxyProtoMode computes the ProxyProtocolMode from the
@@ -679,25 +827,15 @@ func run(args []string) error {
 	logger.SetPrefix(fmt.Sprintf("[%d] ", os.Getpid()))
 	logger.Printf("starting ghostunnel in %s mode", command)
 
-	// Landlock
+	// The process sandbox. It is attempted on every platform (setupSandbox
+	// in landlock_<platform>.go) and the outcome is what the start line
+	// reports. Only an applied sandbox serves; a build with no sandbox
+	// facility runs only under an explicit --accept-no-sandbox naming this
+	// OS. Both are checked by serverValidateFlags and clientValidateFlags
+	// below and again by openRing before any listener binds.
 	pkcs11Enabled := pkcs11Module != nil && *pkcs11Module != ""
-	hasLandlock := runtime.GOOS == "linux" && !*disableLandlock
-
-	if pkcs11Enabled && hasLandlock {
-		logger.Printf("note: using pkcs11, skipping landlock setup (landlock is not compatible with pkcs11)")
-	}
-	if !pkcs11Enabled && hasLandlock {
-		logger.Printf("setting up landlock rules to limit process privileges")
-
-		// Continue even if landlock errs out. Landlock is a new-ish feature and
-		// not supported on older kernels (net rules were added in v6.7, Jan 2024).
-		// We may change this in a future version of Ghostunnel as we get more
-		// comfortable with Landlock.
-		err := setupLandlock()
-		if err != nil {
-			logger.Printf("warning: unable to set up landlock: %v", err)
-		}
-	}
+	sandboxOutcome = decideSandbox(pkcs11Enabled)
+	logger.Printf("process sandbox: %s", sandboxOutcome)
 
 	// Metrics
 	//
@@ -912,27 +1050,46 @@ func serverListen(env *Environment, regoPolicy policy.Policy) error {
 		AllowedPins:     decodedServerPins,
 	}
 
+	// One cache shared by every copy of the ACL (the tunnel's callback, the
+	// resumption hook, the ring's checks); the reload path bumps its
+	// generation (Environment.reload).
+	env.verifyCache = auth.NewVerifyCache(auth.DefaultVerifyCacheSize)
+	serverACL = serverACL.WithVerifyCache(env.verifyCache)
+	var serverConfig certloader.TLSServerConfig
 	if *serverDisableAuth {
 		config.ClientAuth = tls.NoClientCert
+		serverConfig, err = getServerConfig(env.tlsConfigSource, config)
 	} else {
-		if serverACL.PinningEnabled() {
-			// SPKIPin-based verification: require a client cert but skip chain
-			// validation. The ACL callback verifies the SPKI hash instead.
-			config.ClientAuth = tls.RequireAnyClientCert
-		}
-		config.VerifyPeerCertificate = serverACL.VerifyPeerCertificateServer
+		// The ACL is the tunnel's client verifier: on the certificate and
+		// ACME sources it verifies the client's chain itself, with the
+		// options crypto/tls would use, so a repeat client's verification
+		// can be remembered; in pin mode it checks the pin; the
+		// Workload API source verifies through go-spiffe and gets the plain
+		// callback (certloader.GetServerConfigVerifying).
+		serverConfig, err = certloader.GetServerConfigVerifying(env.tlsConfigSource, config, serverACL)
+	}
+	if err != nil {
+		logger.Printf("error: unable to get server TLS config: %s", err)
+		return err
+	}
+
+	// The observer ring's start line describes the configuration as it is
+	// about to be served, so it is written before the listener binds.
+	ringCfg, ringCA, err := ringConfig("server", *serverListenAddress, *serverForwardAddress, serverProxyProtoMode(), serverConfig.GetServerConfig(), sandboxState(), *serverAllowPolicy,
+		ringRules{acl: serverACL, uris: *serverAllowedURIs, disableAuth: *serverDisableAuth})
+	if err != nil {
+		logger.Printf("error: unable to read trust material for the ring trace: %s", err)
+		return err
+	}
+	env.ring, err = openRing(ringCfg, ringCA, serverACL, !*serverDisableAuth, *serverAllowPolicy)
+	if err != nil {
+		return err
 	}
 
 	listener, err := socket.ParseAndOpen(*serverListenAddress)
 	if err != nil {
+		env.ring.close()
 		logger.Printf("error trying to listen: %s", err)
-		return err
-	}
-
-	serverConfig, err := getServerConfig(env.tlsConfigSource, config)
-	if err != nil {
-		listener.Close()
-		logger.Printf("error: unable to get server TLS config: %s", err)
 		return err
 	}
 
@@ -948,11 +1105,18 @@ func serverListen(env *Environment, regoPolicy policy.Policy) error {
 		serverProxyProtoMode(),
 		env.proxyMetrics,
 	)
+	p.CopyBufferSize = int(*copyBufferSize)
+	p.SocketBufferSize = int(*socketBufferSize)
+	p.WarmBackendConnections = warmPoolSize(*warmBackendConnections, "server", *serverForwardAddress)
+	logWarmPool(p.WarmBackendConnections, *warmBackendConnections, "server", *serverForwardAddress)
+	p.WarmBackendIdle = *warmBackendIdle
+	env.attachRing(p)
 
 	if *statusAddress != "" {
 		err := env.serveStatus()
 		if err != nil {
 			listener.Close()
+			env.ring.close()
 			logger.Printf("error serving /_status: %s", err)
 			return err
 		}
@@ -963,17 +1127,39 @@ func serverListen(env *Environment, regoPolicy policy.Policy) error {
 	go p.Accept()
 
 	env.status.Listening()
-	env.status.HandleWatchdog()
+	env.status.HandleWatchdog(env.healthy)
 	env.signalHandler(p)
 	p.Wait()
+	env.ring.close()
 
 	return nil
 }
 
 // Open listening socket in client mode.
 func clientListen(env *Environment) error {
+	// The listener is plaintext: no session tickets and no resumption on
+	// it. The TLS handshake of each connection is the dial to the target.
+	// The ring's start line is written before the listener binds.
+	acl, err := clientACL(env.regoPolicy)
+	if err != nil {
+		return err
+	}
+	// A client dials its backend with no PROXY protocol header: the mode is
+	// a server flag, and the client's start line records off.
+	ringCfg, ringCA, err := ringConfig("client", *clientListenAddress, *clientForwardAddress, proxy.ProxyProtocolOff, nil, sandboxState(), *clientAllowPolicy,
+		ringRules{acl: acl, uris: *clientAllowedURIs, disableAuth: *clientDisableAuth})
+	if err != nil {
+		logger.Printf("error: unable to read trust material for the ring trace: %s", err)
+		return err
+	}
+	env.ring, err = openRing(ringCfg, ringCA, acl, true, *clientAllowPolicy)
+	if err != nil {
+		return err
+	}
+
 	listener, err := socket.ParseAndOpen(*clientListenAddress)
 	if err != nil {
+		env.ring.close()
 		logger.Printf("error opening socket: %s", err)
 		return err
 	}
@@ -990,11 +1176,18 @@ func clientListen(env *Environment) error {
 		proxy.ProxyProtocolOff,
 		env.proxyMetrics,
 	)
+	p.CopyBufferSize = int(*copyBufferSize)
+	p.SocketBufferSize = int(*socketBufferSize)
+	p.WarmBackendConnections = warmPoolSize(*warmBackendConnections, "client", *clientForwardAddress)
+	logWarmPool(p.WarmBackendConnections, *warmBackendConnections, "client", *clientForwardAddress)
+	p.WarmBackendIdle = *warmBackendIdle
+	env.attachRing(p)
 
 	if *statusAddress != "" {
 		err := env.serveStatus()
 		if err != nil {
 			listener.Close()
+			env.ring.close()
 			logger.Printf("error serving /_status: %s", err)
 			return err
 		}
@@ -1005,11 +1198,31 @@ func clientListen(env *Environment) error {
 	go p.Accept()
 
 	env.status.Listening()
-	env.status.HandleWatchdog()
+	env.status.HandleWatchdog(env.healthy)
 	env.signalHandler(p)
 	p.Wait()
+	env.ring.close()
 
 	return nil
+}
+
+// attachRing makes the observer ring the proxy's observer (consulted on
+// every accept), the status handler's refusal source (so /_status answers
+// 503 while serving is refused), and starts the watch that closes the
+// connections in flight when serving becomes refused.
+func (env *Environment) attachRing(p *proxy.Proxy) {
+	env.proxy = p
+	p.Observer = env.ring
+	env.status.refusal = env.ring.refusal
+	go env.ring.watch(p)
+}
+
+// verifiedClientCert reports whether the request arrived over TLS with a
+// client certificate that the listener verified against its trust store.
+// Only a chain the TLS layer built counts; a certificate that was merely
+// presented, or a plaintext request, does not.
+func verifiedClientCert(r *http.Request) bool {
+	return r.TLS != nil && len(r.TLS.PeerCertificates) > 0 && len(r.TLS.VerifiedChains) > 0
 }
 
 // shutdownHandler serves POST /_shutdown by signalling the shutdown channel.
@@ -1023,7 +1236,29 @@ func (env *Environment) shutdownHandler(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	logger.Printf("shutdown was requested via status endpoint")
+	// Stopping the proxy is reserved for callers the status listener has
+	// authenticated: a client certificate that verified against the trust
+	// store. Anything else, including a plaintext request, is refused.
+	if !verifiedClientCert(r) {
+		logger.Printf("shutdown request refused: no verified client certificate")
+		env.ring.shutdownRequested("status-endpoint", false, nil, "POST /_shutdown refused: no verified client certificate")
+		w.WriteHeader(http.StatusForbidden)
+		return
+	}
+
+	// A verified certificate says the caller is someone the trust store
+	// knows; the tunnel's own rule says who is allowed. The same rule the
+	// verifier applies to tunnel clients applies here.
+	peer := r.TLS.PeerCertificates[0].Subject.String()
+	if err := env.ring.shutdownAllowed(r.TLS); err != nil {
+		logger.Printf("shutdown request refused for %s: %s", peer, err)
+		env.ring.shutdownRequested("status-endpoint", false, &peer, "POST /_shutdown refused: not allowed by the tunnel ACL: "+err.Error())
+		w.WriteHeader(http.StatusForbidden)
+		return
+	}
+
+	logger.Printf("shutdown was requested via status endpoint by %s", peer)
+	env.ring.shutdownRequested("status-endpoint", true, &peer, "POST /_shutdown")
 	w.WriteHeader(http.StatusOK)
 
 	// Non-blocking send: if a shutdown has already been requested (the
@@ -1035,8 +1270,70 @@ func (env *Environment) shutdownHandler(w http.ResponseWriter, r *http.Request) 
 	}
 }
 
-// Serve /_status (if configured)
-func (env *Environment) serveStatus() error {
+// cmdlineHandler serves /debug/pprof/cmdline. The stock net/http/pprof
+// handler writes os.Args verbatim, which would hand any secret passed on the
+// command line (--storepass, --pkcs11-pin, a proxy URL with credentials) to
+// whoever can reach the status port. This handler keeps the output shape
+// (arguments separated by NUL) but serves only the program path and flag
+// names; every value is replaced by a placeholder.
+func cmdlineHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	fmt.Fprint(w, strings.Join(redactCmdline(os.Args, knownFlagNames(app.Model())), "\x00"))
+}
+
+// knownFlagNames collects every flag name kingpin knows for the application
+// and its commands, in the spellings the command line accepts (--name,
+// --no-name for booleans, and -s for a short form).
+func knownFlagNames(model *kingpin.ApplicationModel) map[string]bool {
+	names := make(map[string]bool)
+	addFlags := func(group *kingpin.FlagGroupModel) {
+		for _, flag := range group.Flags {
+			names["--"+flag.Name] = true
+			if flag.IsBoolFlag() {
+				names["--no-"+flag.Name] = true
+			}
+			if flag.Short != 0 {
+				names["-"+string(flag.Short)] = true
+			}
+		}
+	}
+	var addCommands func(*kingpin.CmdGroupModel)
+	addCommands = func(group *kingpin.CmdGroupModel) {
+		for _, cmd := range group.Commands {
+			addFlags(cmd.FlagGroupModel)
+			addCommands(cmd.CmdGroupModel)
+		}
+	}
+	addFlags(model.FlagGroupModel)
+	addCommands(model.CmdGroupModel)
+	return names
+}
+
+// redactCmdline keeps args[0] and every argument that is a known flag name,
+// with the value of a --name=value form replaced. Everything else, including
+// the subcommand and space-separated values, becomes "<redacted>". The
+// output is built from an allowlist, so an argument that is not a flag name
+// is never served, whichever flag it belongs to.
+func redactCmdline(args []string, known map[string]bool) []string {
+	out := make([]string, 0, len(args))
+	for i, arg := range args {
+		switch name, _, hasValue := strings.Cut(arg, "="); {
+		case i == 0:
+			out = append(out, arg)
+		case known[name] && hasValue:
+			out = append(out, name+"=<redacted>")
+		case known[arg]:
+			out = append(out, arg)
+		default:
+			out = append(out, "<redacted>")
+		}
+	}
+	return out
+}
+
+// statusMux builds the handler tree served on the status port.
+func (env *Environment) statusMux() *http.ServeMux {
 	promHandler := promhttp.Handler()
 
 	mux := http.NewServeMux()
@@ -1062,12 +1359,36 @@ func (env *Environment) serveStatus() error {
 	}
 
 	if *enableProf {
-		mux.Handle("/debug/pprof/", http.HandlerFunc(pprof.Index))
-		mux.Handle("/debug/pprof/cmdline", http.HandlerFunc(pprof.Cmdline))
-		mux.Handle("/debug/pprof/profile", http.HandlerFunc(pprof.Profile))
-		mux.Handle("/debug/pprof/symbol", http.HandlerFunc(pprof.Symbol))
-		mux.Handle("/debug/pprof/trace", http.HandlerFunc(pprof.Trace))
+		// Every profiling endpoint, the index with the named profiles it
+		// serves included, acts only for a caller the status listener
+		// authenticated, as /_shutdown does: a CPU profile, a runtime trace
+		// or a goroutine dump is not for whoever can reach the port.
+		mux.Handle("/debug/pprof/", requireVerifiedClientCert(http.HandlerFunc(pprof.Index)))
+		mux.Handle("/debug/pprof/cmdline", requireVerifiedClientCert(http.HandlerFunc(cmdlineHandler)))
+		mux.Handle("/debug/pprof/profile", requireVerifiedClientCert(http.HandlerFunc(pprof.Profile)))
+		mux.Handle("/debug/pprof/symbol", requireVerifiedClientCert(http.HandlerFunc(pprof.Symbol)))
+		mux.Handle("/debug/pprof/trace", requireVerifiedClientCert(http.HandlerFunc(pprof.Trace)))
 	}
+
+	return mux
+}
+
+// requireVerifiedClientCert serves h only to a request that arrived over
+// TLS with a client certificate the listener verified (verifiedClientCert);
+// anything else is refused with 403 before h runs.
+func requireVerifiedClientCert(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !verifiedClientCert(r) {
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		h.ServeHTTP(w, r)
+	})
+}
+
+// Serve /_status (if configured)
+func (env *Environment) serveStatus() error {
+	mux := env.statusMux()
 
 	https, addr := socket.ParseHTTPAddress(*statusAddress)
 
@@ -1076,13 +1397,24 @@ func (env *Environment) serveStatus() error {
 		return err
 	}
 
+	// TLS is only served on TCP with a certificate source that can act as a
+	// server; unix/systemd/launchd listeners and http:// addresses serve
+	// plain HTTP, on which no caller can be authenticated.
+	serveTLS := network == "tcp" && https && env.tlsConfigSource.CanServe()
+	if *enableShutdown && !serveTLS {
+		return fmt.Errorf("--enable-shutdown requires a TLS status listener: /_shutdown only acts for a caller with a verified client certificate")
+	}
+	if *enableProf && !serveTLS {
+		return fmt.Errorf("--enable-pprof requires a TLS status listener: /debug/pprof only acts for a caller with a verified client certificate")
+	}
+
 	listener, err := socket.Open(network, address)
 	if err != nil {
 		logger.Printf("error: unable to bind on status port: %s\n", err)
 		return err
 	}
 
-	if network == "tcp" && https && env.tlsConfigSource.CanServe() {
+	if serveTLS {
 		// The status endpoint deliberately doesn't apply --alpn: it always
 		// serves HTTPS, so a tunnel configured for some other protocol (e.g.
 		// --alpn=postgresql) would otherwise lock out monitoring clients.
@@ -1090,7 +1422,11 @@ func (env *Environment) serveStatus() error {
 		if err != nil {
 			return err
 		}
-		config.ClientAuth = tls.NoClientCert
+		// Monitoring clients need no certificate and get the health summary.
+		// The deployment details in /_status and the shutdown endpoint are
+		// reserved for a caller whose certificate verified against the trust
+		// store, so ask for one and verify it if given.
+		config.ClientAuth = tls.VerifyClientCertIfGiven
 
 		serverConfig, err := getServerConfig(env.tlsConfigSource, config)
 		if err != nil {
@@ -1115,10 +1451,15 @@ func (env *Environment) serveStatus() error {
 		IdleTimeout:       120 * time.Second,
 	}
 
+	env.statusListener = listener
 	go func() {
 		err := env.statusHTTP.Serve(listener)
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
-			logger.Printf("error serving status port: %s", err)
+			// The status surface is part of what the ring observes; without
+			// it the process is not the deployment the start line describes.
+			// A Serve error is a sticky refusal, logged once here.
+			logger.Printf("ring: status listener failed, refusing to serve until restart: %s", err)
+			env.ring.statusServeFailed(err)
 		}
 	}()
 
@@ -1155,26 +1496,14 @@ func clientBackendDialer(
 		config.ServerName = *clientServerName
 	}
 
-	allowedURIs, err := wildcard.CompileList(*clientAllowedURIs)
-	if err != nil {
-		logger.Printf("invalid URI pattern in --verify-uri flag (%s)", err)
-		return nil, nil, err
-	}
-
 	regoPolicy, err := loadOPAPolicy(*clientAllowPolicy, *clientAllowQuery)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	clientACL := auth.ACL{
-		AllowedCNs:      *clientAllowedCNs,
-		AllowedOUs:      *clientAllowedOUs,
-		AllowedDNSs:     *clientAllowedDNSs,
-		AllowedIPs:      *clientAllowedIPs,
-		AllowedURIs:     allowedURIs,
-		AllowOPAQuery:   regoPolicy,
-		OPAQueryTimeout: *connectTimeout,
-		AllowedPins:     decodedClientPins,
+	clientACL, err := clientACL(regoPolicy)
+	if err != nil {
+		return nil, nil, err
 	}
 
 	if clientACL.PinningEnabled() {
@@ -1212,6 +1541,25 @@ func clientBackendDialer(
 			return d.DialContext(ctx, network, address)
 		},
 		regoPolicy, nil
+}
+
+// clientACL builds the server-verification ACL from the --verify-* flags.
+func clientACL(regoPolicy policy.Policy) (auth.ACL, error) {
+	allowedURIs, err := wildcard.CompileList(*clientAllowedURIs)
+	if err != nil {
+		logger.Printf("invalid URI pattern in --verify-uri flag (%s)", err)
+		return auth.ACL{}, err
+	}
+	return auth.ACL{
+		AllowedCNs:      *clientAllowedCNs,
+		AllowedOUs:      *clientAllowedOUs,
+		AllowedDNSs:     *clientAllowedDNSs,
+		AllowedIPs:      *clientAllowedIPs,
+		AllowedURIs:     allowedURIs,
+		AllowOPAQuery:   regoPolicy,
+		OPAQueryTimeout: *connectTimeout,
+		AllowedPins:     decodedClientPins,
+	}, nil
 }
 
 func proxyLoggerFlags(flags []string) int {

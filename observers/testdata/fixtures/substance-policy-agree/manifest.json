@@ -1,0 +1,99 @@
+{
+    "fixture": "substance-policy-agree",
+    "description": "An OPA policy alone decides: the policy on disk, hashed as the rule set records it, allows CN client.example and denies the rest. The client chain allowed under policy and the other chain denied under none are what the members compute with the same query. Nothing fires.",
+    "rules": [
+        "SPEC 14.3"
+    ],
+    "reader": "tunnel",
+    "reader_booted": false,
+    "parameters": {
+        "window": 4,
+        "stale_slack_cycles": 1,
+        "staging_stale_after_seconds": 60,
+        "max_heartbeat_bytes": 8192,
+        "max_fault_bytes": 8192,
+        "max_halt_bytes": 8192,
+        "now": "2026-09-20T10:07:25Z"
+    },
+    "directories": [
+        "gt",
+        "gt/0000000001",
+        "gt/chains",
+        "gt/material",
+        "material",
+        "stores/admin",
+        "stores/admin/copy",
+        "stores/admin/copy-super",
+        "stores/admin/copy-super/heartbeat",
+        "stores/admin/copy/heartbeat",
+        "stores/admin/halts",
+        "stores/admin/heartbeat",
+        "stores/material",
+        "stores/material/copy",
+        "stores/material/copy-super",
+        "stores/material/copy-super/heartbeat",
+        "stores/material/copy/heartbeat",
+        "stores/material/halts",
+        "stores/material/heartbeat",
+        "stores/super",
+        "stores/super/copy-admin",
+        "stores/super/copy-admin/heartbeat",
+        "stores/super/copy-material",
+        "stores/super/copy-material/heartbeat",
+        "stores/super/copy-tunnel",
+        "stores/super/copy-tunnel/heartbeat",
+        "stores/super/halts",
+        "stores/super/heartbeat",
+        "stores/tunnel",
+        "stores/tunnel/copy",
+        "stores/tunnel/copy-super",
+        "stores/tunnel/copy-super/heartbeat",
+        "stores/tunnel/copy/heartbeat",
+        "stores/tunnel/halts",
+        "stores/tunnel/heartbeat",
+        "traces/daily"
+    ],
+    "traces": [
+        {
+            "schedule": "daily",
+            "period_seconds": 86400,
+            "margin_seconds": 600,
+            "deadline_seconds": 3600,
+            "declared": [
+                "prune-metrics",
+                "reset-daily-counters",
+                "reset-counters",
+                "expire-leases",
+                "expire-tokens",
+                "expire-transfers",
+                "expire-pending-changes",
+                "truncate-daily-log",
+                "rollover:new-day"
+            ]
+        }
+    ],
+    "expect": {
+        "verdicts": {
+            "admin": "alive",
+            "material": "alive",
+            "super": "alive"
+        },
+        "failing": [],
+        "halt_in_force_before": false,
+        "halt": {
+            "writes": false
+        },
+        "trace": {
+            "boot": 1,
+            "records": 10,
+            "torn": false,
+            "segments": {
+                "0000000001.trace": 2951
+            }
+        },
+        "surface": {
+            "policy_query": "data.policy.allow",
+            "findings": []
+        }
+    }
+}

@@ -36,8 +36,14 @@ example, in client mode with `--disable-authentication`).
 How to check status and read connection metrics:
 
 ```bash
-# Status information (JSON)
+# Health summary (JSON): ok, status, message, backend_ok, backend_status, time
 curl --cacert test-keys/cacert.pem https://localhost:6060/_status
+
+# Full status information (JSON), for a caller with a client certificate
+# that verifies against the trust store
+curl --cacert test-keys/cacert.pem \
+    --cert test-keys/client-cert.pem --key test-keys/client-key.pem \
+    https://localhost:6060/_status
 
 # Metrics information (JSON)
 curl --cacert test-keys/cacert.pem 'https://localhost:6060/_metrics/json'
@@ -77,7 +83,13 @@ more on pprof, see the [`runtime/pprof`][pprof] and
 If `--enable-shutdown` is set, a `/_shutdown` endpoint is available on the
 status port. Sending an HTTP POST request to this endpoint will trigger a
 graceful shutdown of the Ghostunnel process. Any other HTTP method returns 405
-Method Not Allowed. For details on what happens after shutdown is triggered,
+Method Not Allowed. The request must present a client certificate that
+verifies against the trust store (`--cacert`); a request without one returns
+403 Forbidden. Because of that, `--enable-shutdown` requires a TLS status
+listener: Ghostunnel refuses to start if the status port would serve plain
+HTTP (a `unix:`, `systemd:` or `launchd:` listener, an `http://` address, or
+a certificate source that cannot act as a server). For details on what
+happens after shutdown is triggered,
 including signal handling, connection draining, and the `--shutdown-timeout`
 flag, see
 [Graceful Shutdown]({{< ref "graceful-shutdown.md" >}}).
@@ -96,9 +108,20 @@ The `/_status` JSON response includes:
 
 * `backend_ok`: boolean indicating if the backend check passed
 * `backend_status`: string of `ok` or `critical`
-* `backend_error`: string of error message if the check failed
+* `backend_error`: string of error message if the check failed (detailed
+  view only)
 
 If the backend check fails, the `/_status` endpoint returns HTTP 503.
+
+The status listener asks for a client certificate but does not require one.
+A request without a certificate that verifies against the trust store gets
+the health summary only (`ok`, `status`, `message`, `backend_ok`,
+`backend_status`, `time`), and its backend check is served from a shared
+result refreshed at most every five seconds, so an unauthenticated caller
+cannot make Ghostunnel probe the target on demand. A request with a verified
+client certificate gets the detailed view as well (`listen_address`,
+`forward_address`, `backend_error`, `hostname`, `last_reload`, `revision`,
+`compiler`) and a fresh backend check.
 
 ## Metric Names
 

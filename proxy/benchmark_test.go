@@ -20,7 +20,30 @@ func BenchmarkCopyData(b *testing.B) {
 	}
 }
 
+// BenchmarkCopyDataBufferSize is BenchmarkCopyData at bulk transfer sizes
+// (32 KiB, 256 KiB, 1 MiB) for each copy buffer size, with a sink that reads
+// 1 MiB at a time so the pipe never bounds the chunk the copy loop moves.
+// Note net.Pipe is synchronous, so this measures the loop's own overhead
+// per chunk, not the syscall cost a socket has; BenchmarkBulkThroughput
+// measures that.
+func BenchmarkCopyDataBufferSize(b *testing.B) {
+	for _, bufSize := range []int{32 << 10, 64 << 10, 128 << 10, 256 << 10} {
+		for _, size := range []int{32 << 10, 256 << 10, 1 << 20} {
+			b.Run(fmt.Sprintf("buf=%dK/transfer=%dK", bufSize>>10, size>>10), func(b *testing.B) {
+				proxy := proxyForTest(nil, nil)
+				proxy.CopyBufferSize = bufSize
+				b.SetBytes(int64(size))
+				benchmarkCopyDataSink(b, proxy, size, 1<<20)
+			})
+		}
+	}
+}
+
 func benchmarkCopyData(b *testing.B, proxy *Proxy, size int) {
+	benchmarkCopyDataSink(b, proxy, size, 1<<10)
+}
+
+func benchmarkCopyDataSink(b *testing.B, proxy *Proxy, size, sinkSize int) {
 	b.ReportAllocs()
 	b.ResetTimer()
 
@@ -45,7 +68,7 @@ func benchmarkCopyData(b *testing.B, proxy *Proxy, size int) {
 
 		go func() {
 			var err error
-			buf := make([]byte, 1<<10)
+			buf := make([]byte, sinkSize)
 			for err == nil {
 				_, err = dstOut.Read(buf)
 			}

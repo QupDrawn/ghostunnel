@@ -1,0 +1,87 @@
+{
+    "fixture": "inv5-own-file-altered",
+    "description": "tunnel's own 44 on disk differs from what tunnel remembers writing (manifest memory holds the original hashes). I5 with the file's path. The copies still hold the original bytes.",
+    "rules": [
+        "SPEC 11.1 I5",
+        "SPEC 4"
+    ],
+    "reader": "tunnel",
+    "reader_booted": false,
+    "parameters": {
+        "window": 4,
+        "stale_slack_cycles": 1,
+        "staging_stale_after_seconds": 60,
+        "max_heartbeat_bytes": 8192,
+        "max_fault_bytes": 8192,
+        "max_halt_bytes": 8192,
+        "now": "2026-09-20T10:07:25Z"
+    },
+    "directories": [
+        "stores/admin",
+        "stores/admin/copy",
+        "stores/admin/copy-super",
+        "stores/admin/copy-super/heartbeat",
+        "stores/admin/copy/heartbeat",
+        "stores/admin/halts",
+        "stores/admin/heartbeat",
+        "stores/material",
+        "stores/material/copy",
+        "stores/material/copy-super",
+        "stores/material/copy-super/heartbeat",
+        "stores/material/copy/heartbeat",
+        "stores/material/halts",
+        "stores/material/heartbeat",
+        "stores/super",
+        "stores/super/copy-admin",
+        "stores/super/copy-admin/heartbeat",
+        "stores/super/copy-material",
+        "stores/super/copy-material/heartbeat",
+        "stores/super/copy-tunnel",
+        "stores/super/copy-tunnel/heartbeat",
+        "stores/super/halts",
+        "stores/super/heartbeat",
+        "stores/tunnel",
+        "stores/tunnel/copy",
+        "stores/tunnel/copy-super",
+        "stores/tunnel/copy-super/heartbeat",
+        "stores/tunnel/copy/heartbeat",
+        "stores/tunnel/halts",
+        "stores/tunnel/heartbeat"
+    ],
+    "memory": {
+        "stores/tunnel/heartbeat/0000000041.hb": "ddba99c9f551018ac933f996dff86b8e8ecbea6f128bb8faa2abf2347fbedbc7",
+        "stores/tunnel/heartbeat/0000000042.hb": "8bdb19d0b22f8802c55e917d9051ebae8931cd9e19edfbcac865b6db2a9783a9",
+        "stores/tunnel/heartbeat/0000000043.hb": "ed185461eeca69762e1b6249fb6a17b7ea6ac132fd60354a4dd2ae6f68c3c93b",
+        "stores/tunnel/heartbeat/0000000044.hb": "20b44e5a1dabe143fa9e74e896348f1527f63d364757cdaf36ba1ac15b090a67"
+    },
+    "expect": {
+        "verdicts": {
+            "admin": "alive",
+            "material": "alive",
+            "super": "alive"
+        },
+        "failing": [
+            {
+                "check": "I5",
+                "subject": "tunnel/heartbeat/0000000044.hb"
+            }
+        ],
+        "halt_in_force_before": false,
+        "halt": {
+            "writes": true,
+            "reason": "I5",
+            "subject": "tunnel/heartbeat/0000000044.hb"
+        },
+        "publish": {
+            "sequence": 45,
+            "previous": "20b44e5a1dabe143fa9e74e896348f1527f63d364757cdaf36ba1ac15b090a67",
+            "observed": {
+                "admin": "6dc2b20403b60e05fc5a18ba7308d4df0fc4fc6aa33752736202488a005df32f",
+                "material": "eeaac2b6ca98aec552d5c50651310f359b58f1a8215748bc57551103310a92ad",
+                "super": "d490a767f653a51a8b6b9ef81e75c77c54d8ba112c0de13f449dafd5a2411971"
+            },
+            "boot": null,
+            "stop": false
+        }
+    }
+}

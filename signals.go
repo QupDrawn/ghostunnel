@@ -18,6 +18,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/signal"
 	"slices"
@@ -84,6 +85,7 @@ func (env *Environment) signalHandler(p *proxy.Proxy) {
 			return
 		case <-serviceShutdownChan(): // nil on non-Windows; nil channel blocks forever, disabling this case
 			logger.Printf("Windows service stop requested, shutting down")
+			env.ring.shutdownRequested("service-control", true, nil, "Windows service stop")
 
 			shutdownFunc()
 
@@ -91,6 +93,7 @@ func (env *Environment) signalHandler(p *proxy.Proxy) {
 		case sig := <-signals:
 			if isShutdownSignal(sig) {
 				logger.Printf("received %s, shutting down", sig.String())
+				env.ring.shutdownRequested("signal", true, nil, sig.String())
 
 				shutdownFunc()
 
@@ -114,13 +117,26 @@ func (env *Environment) reloadHandler(interval time.Duration) {
 
 func (env *Environment) reload() {
 	env.status.Reloading()
+	var reloadErr error
 	if err := env.tlsConfigSource.Reload(); err != nil {
 		logger.Printf("error reloading TLS configuration: %s", err)
+		reloadErr = err
 	}
 	if env.regoPolicy != nil {
 		if err := env.regoPolicy.Reload(); err != nil {
 			logger.Printf("error reloading OPA policy: %s", err)
+			reloadErr = errors.Join(reloadErr, err)
 		}
+	}
+	// Whether or not the reload succeeded, some input may have changed.
+	env.verifyCache.Invalidate()
+	if !env.ring.reloaded(reloadErr) {
+		// A failed reload does not put the process back into service: the
+		// ring refuses every accept until a reload succeeds, and the
+		// service manager is not told READY again.
+		logger.Printf("reloading configuration failed")
+		env.status.ReloadFailed()
+		return
 	}
 	logger.Printf("reloading configuration complete")
 	env.status.Listening()

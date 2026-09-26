@@ -1,0 +1,5 @@
+{"kind":"trace","version":1,"schedule":"daily","run":123,"started":"2026-09-20T08:58:20Z"}
+{"kind":"task","id":"prune-metrics","completed":true,"count":0}
+{"kind":"task","id":"reset-daily-counters","completed":true,"count":0}
+{"kind":"task","id":"reset-counters","completed":true,"count":0}
+{"kind":"task","id":"expire-leases","completed":true,"count":0}

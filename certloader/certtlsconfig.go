@@ -64,9 +64,26 @@ func (c *certTLSConfigSource) GetServerConfig(base *tls.Config) (TLSServerConfig
 	return newCertTLSConfig(c.cert, base), nil
 }
 
+// GetServerConfigVerifying implements ClientVerifyingSource: the configs
+// returned verify the client's chain through verifier, bound per trust
+// store (see GetServerConfigVerifying and bindClientVerifier).
+func (c *certTLSConfigSource) GetServerConfigVerifying(base *tls.Config, verifier ClientVerifier) (TLSServerConfig, error) {
+	if !c.CanServe() {
+		return nil, ErrNotServerCert
+	}
+	config := newCertTLSConfig(c.cert, verifyingBase(base, verifier))
+	config.verifier = verifier
+	return config, nil
+}
+
 type certTLSConfig struct {
 	cert Certificate
 	base *tls.Config
+
+	// verifier, when set, verifies the client's chain in place of
+	// crypto/tls; the built server config binds it to the trust store it
+	// is built for.
+	verifier ClientVerifier
 
 	// Cached configs, keyed on the trust-store pointer. The certificate is
 	// served via a callback, so only the trust store can change the built
@@ -108,10 +125,16 @@ func (c *certTLSConfig) GetServerConfig() *tls.Config {
 	// so ClientCAs never authenticates anything; its only effect is the
 	// certificate_authorities hint Go advertises in the handshake. In pin mode
 	// that hint is actively misleading — a strict client may withhold a pinned
-	// cert that doesn't chain to it — so we leave ClientCAs nil.
+	// cert that doesn't chain to it — so we leave ClientCAs nil. A verifier
+	// that verifies the chain itself is also under RequireAnyClientCert, and
+	// gets the pool both as the hint and as its roots (bindClientVerifier).
 	if c.base.ClientAuth != tls.RequireAnyClientCert {
 		config.ClientCAs = pool
 	}
+	if c.verifier != nil {
+		bindClientVerifier(config, pool, c.verifier)
+	}
+	reverifyResumedSessions(config)
 	c.cachedServer.Store(&cachedTLSConfig{pool: pool, config: config})
 	return config
 }

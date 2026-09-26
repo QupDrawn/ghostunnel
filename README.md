@@ -1,3 +1,188 @@
+A ghostunnel that never serves unobserved
+=========================================
+
+A fork of [Ghostunnel](https://github.com/ghostunnel/ghostunnel) with an
+observer ring attached. The proxy is upstream's, and upstream's
+README follows this introduction. What the fork adds is a rule the code
+enforces on every connection: ghostunnel serves only while four separate
+programs, watching its trace and each other, find nothing wrong.
+
+What it costs
+-------------
+
+Every served connection writes its record to disk and waits for the sync
+before a byte is forwarded, and the proxy asks the gate on every accept. The
+benchmark under `bench/` measures what that costs against upstream ghostunnel
+at the same commit, both proxies driven by the same client against the same
+echo on another host, 333 rounds of 300 connections each.
+
+With the warm backend pool the fork keeps by default, the record's sync
+overlaps the backend dial and the fork comes out ahead on every line:
+
+![bench: fork against base with the warm backend pool](pics/1.png)
+
+With the pool off (`--warm-backend-connections 0`), the fork pays its sync in
+full and still holds level with base:
+
+![bench: fork against base without the warm backend pool](pics/2.png)
+
+`bench/README.md` says how to run it and what the host needs.
+
+The fork in one page
+--------------------
+
+**The proxy leaves a trace.** Under `gt/` (`--ring-traces`) ghostunnel
+appends one JSON line per event: its start line with the configuration it
+serves, every accept, every handshake with its outcome, every access
+decision with the rule that decided it, every close with its reason, every
+reload, every shutdown request, every failed accept, every refusal, and a
+tick every five seconds so a quiet proxy and a dead one leave different
+traces. The trace is append-only, strictly formatted, and durable before
+any byte of a connection is forwarded. Beside it two content-addressed
+stores keep what the lines name: `gt/chains/` holds every certificate chain
+a peer presented, and `gt/material/` every CA bundle the proxy verified
+against, each under the SHA-256 of its bytes (`ringtrace/README.md`).
+
+**Four observers watch it, and each other.** `observers/tunnel` judges the
+data path (the listener, verification on every handshake, the access
+decisions, the lifetime cap), `observers/admin` the status surface,
+`observers/material` the trust material and its reload, and
+`observers/super`, the coordinator, nothing of its own: it holds copies of
+the other three and reads the trace as they do. Each runs as its own user
+and owns a store of files: a chained heartbeat every cycle, a `fault` while
+one of its own checks fails, a `halt` when anything fails, and a copy of a
+peer's heartbeat that the peer's store must match. Every member reads
+every other member's store every cycle, roughly three times a second
+(`observers/README.md`, `observers/SPEC.md`).
+
+**The proxy consults a gate on every accept.** Before a connection is
+served, ghostunnel reads the store tree: a `halt` or `fault` in any store,
+a delivered halt in any `halts/`, or a coordinator heartbeat that is
+missing, malformed, stopped, or more than `--ring-heartbeat-max-age` from
+its clock in either direction refuses the connection. The read happens on
+every accept, from a standing decision refreshed on every change the
+kernel reports and by a full scan every second (`ringtrace/README.md`,
+section 3).
+
+**Halt on any fault, recovery by unanimity.** A member whose check fails
+writes a halt in its own store and a slot in every other member's `halts/`;
+the others relay it. The proxy refuses new connections at once and closes
+the ones in flight within a second, each with a `close` of reason `halt`.
+Nothing lifts until the failing member's check passes and it clears its
+fault, the coordinator sees no fault at any root and stands down, and every
+member follows. Then the proxy serves again on the next accept, with no
+restart and no dwell.
+
+**Five users, one writer per path.** The deployment is five systemd units
+on one Linux host: `gt` for the proxy and one `gtobs-*` user per member.
+Directory ownership, the sticky bit on shared `halts/` directories, and
+each unit's `ReadWritePaths=` give every path in the tree exactly one
+writer. The proxy can write its trace and nothing else; a member can write
+its own store, one peer's copy, and one slot in each other member's
+`halts/`; nobody can remove a halt they did not write (`deploy/README.md`).
+
+What it gives a developer
+-------------------------
+
+- **A trace you can read and diff.** Every accept, handshake, access
+  decision, close, reload, shutdown request, failed accept and refusal is
+  one line, in sequence, with exact keys and closed vocabularies. `go test`
+  fixtures and a deployment's `gt/` read the same way.
+- **Four small programs and an oracle.** The observers are four packages
+  with one structural core, judged against 92 fixtures under
+  `observers/testdata/fixtures`: snapshots of a store tree with the
+  verdicts, failing checks, halt, publication, relay and clears a member
+  must produce over them. They run without a proxy, without a ring and
+  without the network (`observers/testdata/FIXTURES.md`).
+- **Re-verification from bytes.** The members do not take the proxy's word
+  for a handshake or an access decision. For every served connection they
+  read the presented chain from `gt/chains/`, verify it against the CA
+  bundle from `gt/material/` under the hash the start line or the last
+  reload recorded, and re-run the recorded rule set on the leaf, OPA policy
+  included. A change to the verifier that lets the wrong peer through halts
+  the ring: in tests, through the differential test that holds each
+  member's mirror to the proxy's verifier, and in production, through
+  `acl-substance` on the live trace.
+- **`ringstatus`.** `observers/ringstatus` prints the ring as it stands:
+  the verdict, each member's state and cadence, who has read whom, the
+  copies, and any delivered halt. It reads the stores and writes nothing
+  (`observers/ringstatus/README.md`).
+- **A benchmark tool.** `bench/` measures what the ring costs the proxy per
+  connection, with and without the trace and the gate on the accept path,
+  against the same backend; `bench/README.md` says how to run it and how to
+  read what it prints.
+
+What the ring guarantees, and what enforces it
+----------------------------------------------
+
+Stated only as far as the code enforces them. The threat model
+(`docs/security/threat-model.md`) states each guarantee with the line that
+enforces it, the residual issues that hold in this tree, and the limits the
+ring declares.
+
+- **The proxy serves only while the coordinator's heartbeat is fresh and no
+  halt exists in any store.** `ringtrace.Gate.Check` reads every member's
+  `halt`, `fault` and `halts/` and the coordinator's newest heartbeat, and
+  refuses on the first failure; `ring.Accepted` calls it on every accept
+  through a `GateState` whose standing decision is dropped on any change the
+  kernel reports on the tree, and re-scanned every second regardless
+  (`ring.watch`). A serve decision is never reused past the heartbeat's
+  window: its age is judged by the clock on every reuse.
+- **A fault at any member stops the proxy within that member's cycle plus
+  the watch interval.** The member writes its halt and slots at the end of
+  the cycle that found the fault (SPEC 12.1); the next accept sees the slot
+  (the watcher reports the write) and the watch's next scan, at most a
+  second later, closes every connection in flight (`proxy.CloseAll`).
+- **Recovery needs every member's fault gone and the coordinator's
+  stand-down.** A member removes its own slots and halt only when no store
+  holds a `fault` and the coordinator's own `halt` is gone; the coordinator
+  removes its only when no store holds a `fault` and none of its own checks
+  failed (SPEC 12.3, `decideHalts`). The gate reads `fault` as well as
+  `halt`, so a fault stops serving before the halt it will become is even
+  written.
+- **Every served connection's chain is re-verified against the CA bundle as
+  stored under its hash, and the access rule re-run.** `handshake-substance`
+  and `acl-substance` in every member read the chain by its hash, refuse a
+  file whose bytes do not hash to its name, read the bundle in force at the
+  line by the recorded hash and never by its path, and compare the member's
+  own decision and rule with the recorded ones; a disagreement halts (SPEC
+  14.3).
+- **The trace is read by content and never trusted by size.** Segments are
+  pre-extended to their maximum size, so a segment's length says nothing;
+  every reader takes a segment's content as its bytes before the first NUL,
+  in bounded chunks, and `trace-consistent` remembers the hash of the
+  prefix it read and halts if that prefix changes, shrinks or vanishes
+  (SPEC 14, `ringtrace/README.md` 1.3).
+- **A member that cannot answer has not passed.** An unreadable store, a
+  heartbeat that will not parse, a chain that will not verify, a trace that
+  cannot be read, a process table that cannot be seen: each fails the check
+  that needed it, and the failure halts (SPEC 11.3, 14.3).
+
+What the ring does not do
+-------------------------
+
+It runs on one host. Every member, the proxy and the stores share one
+kernel and one service manager, and whoever holds the host holds all of
+them. It cannot stop a proxy rewritten not to consult the gate; it detects
+one, because the connections such a proxy serves are in a trace every
+member re-verifies, and a proxy whose trace stops is one every member
+reports. It does not establish which build was intended, that a store
+bearing a member's name was meant to be that member, or anything about its
+own code (SPEC 20).
+
+Where to read next
+------------------
+
+- `observers/README.md`: the four members, what each watches, the stores,
+  faults, halts, recovery, and how to run the tests.
+- `observers/SPEC.md`: the normative specification the members implement.
+- `ringtrace/README.md`: the trace format, the two stores, the emitter and
+  the gate.
+- `deploy/README.md`: the tree, the users, the units, and what to do when
+  the ring halts.
+
+Upstream's README follows.
+
 Ghostunnel
 ==========
 

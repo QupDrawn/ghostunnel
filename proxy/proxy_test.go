@@ -399,7 +399,20 @@ func TestProxySuccess(t *testing.T) {
 	p.Wait()
 }
 
+// TestProxyProtocolSuccess: the PROXY header is the first thing the backend
+// reads on a served connection, and the client's bytes follow it, with the
+// warm backend pool off (the default) and on. With the pool on the backend
+// connection was opened before the client was accepted, and the header is
+// still written first, by the handler, once the client is accepted.
 func TestProxyProtocolSuccess(t *testing.T) {
+	for _, warm := range []int{0, 3} {
+		t.Run(fmt.Sprintf("warm=%d", warm), func(t *testing.T) {
+			testProxyProtocolSuccess(t, warm)
+		})
+	}
+}
+
+func testProxyProtocolSuccess(t *testing.T, warm int) {
 	// Incoming listener
 	incoming, err := net.Listen("tcp", "127.0.0.1:0")
 	assert.Nil(t, err, "should be able to listen on random port")
@@ -408,24 +421,70 @@ func TestProxyProtocolSuccess(t *testing.T) {
 	target, err := net.Listen("tcp", "127.0.0.1:0")
 	assert.Nil(t, err, "should be able to listen on random port")
 
-	dialer := func(ctx context.Context) (net.Conn, error) {
-		var d net.Dialer
-		return d.DialContext(ctx, "tcp", target.Addr().String())
-	}
+	dialer := &countingDialer{addr: target.Addr().String()}
 
 	// Start accept loop
-	p := proxyForTestWithProxyProtocol(incoming, dialer)
+	p := proxyForTestWithProxyProtocol(incoming, dialer.dial)
+	p.WarmBackendConnections = warm
 	go p.Accept()
 	defer p.Shutdown()
+
+	// The pooled connections are accepted by the target first, and carry
+	// nothing until a client is served on one.
+	var pooled []net.Conn
+	for i := 0; i < warm; i++ {
+		c, err := target.Accept()
+		assert.Nil(t, err, "should be able to receive pooled connection on target")
+		pooled = append(pooled, c)
+	}
+	if warm > 0 {
+		assert.Equal(t, int64(warm), dialer.pool.Load())
+		for _, c := range pooled {
+			_ = c.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+			n, err := c.Read(make([]byte, 1))
+			assert.Equal(t, 0, n, "a pooled connection carries nothing before a client is served")
+			assert.True(t, isTimeoutError(err), "a pooled connection stays open: %v", err)
+			_ = c.SetReadDeadline(time.Time{})
+		}
+	}
 
 	// Proxy a connection
 	src, err := net.Dial("tcp", incoming.Addr().String())
 	assert.Nil(t, err, "should be able to dial into proxy")
 
-	dst, err := target.Accept()
-	assert.Nil(t, err, "should be able to receive connection on target")
+	var dst net.Conn
+	var reader io.Reader
+	if warm > 0 {
+		// Served on whichever pooled connection the handler took (the
+		// target's accept order says nothing about the pool's order): the
+		// one that receives a byte, which is put back in front of it.
+		type first struct {
+			c net.Conn
+			b byte
+		}
+		firstByte := make(chan first, warm)
+		for _, c := range pooled {
+			go func(c net.Conn) {
+				var b [1]byte
+				if _, err := c.Read(b[:]); err == nil {
+					firstByte <- first{c, b[0]}
+				}
+			}(c)
+		}
+		select {
+		case f := <-firstByte:
+			dst = f.c
+			reader = io.MultiReader(bytes.NewReader([]byte{f.b}), dst)
+		case <-time.After(5 * time.Second):
+			t.Fatal("no pooled connection received the header")
+		}
+	} else {
+		dst, err = target.Accept()
+		assert.Nil(t, err, "should be able to receive connection on target")
+		reader = dst
+	}
 
-	header, err := proxyproto.Read(bufio.NewReaderSize(dst, 12))
+	header, err := proxyproto.Read(bufio.NewReaderSize(reader, 12))
 	assert.Nil(t, err, "should be able to read header")
 	assert.Equal(t, header.Version, uint8(2))
 	assert.Equal(t, header.Command, proxyproto.ProtocolVersionAndCommand(proxyproto.PROXY))
@@ -439,7 +498,7 @@ func TestProxyProtocolSuccess(t *testing.T) {
 
 	received := make([]byte, 1)
 	for {
-		n, err := dst.Read(received)
+		n, err := reader.Read(received)
 		if err != io.EOF {
 			assert.Nil(t, err, "should be able to receive data from connection on target")
 		}
@@ -451,6 +510,11 @@ func TestProxyProtocolSuccess(t *testing.T) {
 	if !bytes.Equal([]byte("A"), received) {
 		t.Error("got wrong data from connection on target")
 	}
+	wantHandlerDials := int64(1)
+	if warm > 0 {
+		wantHandlerDials = 0
+	}
+	assert.Equal(t, wantHandlerDials, dialer.handler.Load(), "with the pool the served connection performs no dial of its own")
 
 	p.Shutdown()
 	dst.Close()
@@ -957,7 +1021,7 @@ func TestCopyDataErrorClassification(t *testing.T) {
 
 		p, logs := newCapturingProxy(LogConnectionErrors)
 		before := connTimeoutCounter.Count()
-		written := p.copyData(dst, src)
+		written, _ := p.copyData(dst, src)
 		after := connTimeoutCounter.Count()
 
 		assert.Equal(t, int64(5), written, "payload should be copied before the error")
@@ -971,7 +1035,7 @@ func TestCopyDataErrorClassification(t *testing.T) {
 		defer dst.Close()
 
 		p, logs := newCapturingProxy(LogConnections)
-		_ = p.copyData(dst, src)
+		_, _ = p.copyData(dst, src)
 
 		assert.Equal(t, 0, countCopyErrorLogs(*logs),
 			"copy errors must be silent without LogConnectionErrors")
@@ -984,7 +1048,7 @@ func TestCopyDataErrorClassification(t *testing.T) {
 
 		p, logs := newCapturingProxy(LogConnectionErrors)
 		before := connTimeoutCounter.Count()
-		_ = p.copyData(dst, src)
+		_, _ = p.copyData(dst, src)
 		after := connTimeoutCounter.Count()
 
 		assert.Equal(t, int64(1), after-before, "timeout must bump connTimeoutCounter")
@@ -998,7 +1062,7 @@ func TestCopyDataErrorClassification(t *testing.T) {
 
 		p, logs := newCapturingProxy(LogConnectionErrors)
 		before := connTimeoutCounter.Count()
-		_ = p.copyData(dst, src)
+		_, _ = p.copyData(dst, src)
 		after := connTimeoutCounter.Count()
 
 		assert.Equal(t, 0, countCopyErrorLogs(*logs),
@@ -1854,4 +1918,38 @@ func TestProxyProtocolWriteFailureClosesBackend(t *testing.T) {
 
 	assert.Equal(t, int64(1), errorCounter.Count(), "PROXY header write failure must increment accept.error")
 	assert.Equal(t, int64(0), successCounter.Count(), "PROXY header write failure must not increment accept.success")
+}
+
+// TestAcceptLoopIteratesWithoutConnections: the accept loop runs Accept
+// with a short deadline so it iterates even with no connection to accept,
+// and records when it last did; a listener closed out from under it is
+// recorded as closed for good.
+func TestAcceptLoopIteratesWithoutConnections(t *testing.T) {
+	incoming, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := proxyForTest(incoming, nil)
+	if !p.LastIteration().IsZero() {
+		t.Fatal("no iteration before Accept runs")
+	}
+	start := time.Now()
+	go p.Accept()
+	defer func() {
+		p.Shutdown()
+		p.Wait()
+	}()
+	time.Sleep(acceptDeadline + 500*time.Millisecond)
+	last := p.LastIteration()
+	if last.Before(start.Add(acceptDeadline)) {
+		t.Fatalf("the loop must have iterated after its first deadline: last iteration %s after start", last.Sub(start))
+	}
+	if p.ListenerClosed() {
+		t.Fatal("the listener is open")
+	}
+	incoming.Close()
+	time.Sleep(acceptDeadline + 500*time.Millisecond)
+	if !p.ListenerClosed() {
+		t.Fatal("a listener closed out from under the loop is recorded as closed")
+	}
 }

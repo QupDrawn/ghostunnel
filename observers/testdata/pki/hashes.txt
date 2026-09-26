@@ -1,0 +1,11 @@
+# Hashes of the committed bytes, for quoting in fixtures and tests.
+ca.pem sha256 89b996c9c451ea98bdfeaf5827ed15e69c9f5a5d109b032c8142f7f724810cf2
+policy.rego sha256 259219f98e0aa3e48f9b56670c074139377b57a9297fea3ed9e57ce51076ad6c
+chain client (leaf-client + intermediate) 6cfe43984b110c899018930dcd57ba56d99193d0cbf49804ec32622750ad3714
+chain other (leaf-other) 88ec9b6db56328b5cbcb0c0a632df0d4c5b0c83a2d01bea306cc498b63833175
+chain rogue (leaf-rogue + rogue-ca) 3e05e8d89f0700d627a7bd7a9cd47ff2cbfda251e7eca2125e13c2bf7e22c716
+chain expired (leaf-expired) 179af4581da0c1e063492a010f5acda684d8121fce433e2945c212f7749d61d2
+spki leaf-client sha256 c8a5488ed95204c189f91e84b24b3abc918b675d086a0c39fe22cd6045879225
+spki leaf-other sha256 eabeaebbd0c5453638aba2044a184d99b6f763a0316c0567910b4af640e4f8e6
+spki leaf-rogue sha256 46ffff51e767bcab88561c0569e74bd63c93249d9011078f80130a0ff9dce5c3
+spki leaf-expired sha256 37192c2bbd65b034949be3d83e305850f9ff31e3a279ef63023a21d2ee914a7a

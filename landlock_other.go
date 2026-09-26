@@ -18,6 +18,20 @@
 
 package main
 
+import "github.com/ghostunnel/ghostunnel/ringtrace"
+
+// setupSandbox is the process sandbox attempt on a build with no sandbox
+// facility: there is nothing to attempt, whatever the flags, and the state
+// is unsupported. Ghostunnel then starts only under --accept-no-sandbox
+// naming this OS (validateSandboxAcceptance). A platform that gains a
+// sandbox (a landlock_windows.go, say) replaces this file with an attempt
+// that returns applied or failed, and nothing else has to change: the
+// acceptance is refused and the start line reports the outcome from the
+// state alone.
+func setupSandbox(pkcs11Enabled bool) string {
+	return ringtrace.SandboxUnsupported
+}
+
 func setupLandlock() error {
 	return nil
 }

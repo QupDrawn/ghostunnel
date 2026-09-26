@@ -1,0 +1,112 @@
+# ghostunnel-obs-tunnel.service: the tunnel member, as user gtobs-tunnel.
+# Its writes are exactly the gtobs-tunnel rows of deploy/write-matrix.tsv;
+# every ReadWritePaths= line below says which row it is.
+[Unit]
+Description=ghostunnel observer ring: tunnel member
+Documentation=file:///usr/share/doc/ghostunnel-ring/README.md
+PartOf=ghostunnel-ring.target
+After=local-fs.target
+
+[Service]
+Type=simple
+User=gtobs-tunnel
+Group=gtobs-tunnel
+# Supplementary groups from /etc/group (setup-tree.sh): gtring-halts-admin,
+# gtring-halts-material, gtring-halts-super, one per halts/ it delivers into,
+# and gtring-pem for the PEM material.
+# The trace root gt/ is gt:gtring-trace 0750 (tree.tsv): every member reads
+# the trace through that group and nobody outside it reads a byte. The grant
+# is stated here as well as in /etc/group, so that a unit without it is
+# refused by check-units.sh --static rather than found by a member halting
+# on trace-readable.
+SupplementaryGroups=gtring-trace
+UMask=0022
+# The EXPECTED listener, backend target, ACL and PROXY protocol mode come
+# from the observers' own file, never from the file the proxy is started
+# with: an expectation read from the proxy's configuration compares a value
+# with itself (README, "Two files, two sources"). check-units.sh --static
+# refuses this unit if it names that file.
+EnvironmentFile=/etc/ghostunnel/observers.env
+# systemd substitutes ${VAR} itself; empty fails the start. The proxy
+# protocol expectation is passed with '=' below and may be empty, which
+# means off; it is not tested here.
+ExecStartPre=/usr/bin/test -n "${GT_EXPECT_LISTEN}"
+ExecStartPre=/usr/bin/test -n "${GT_EXPECT_TARGET}"
+ExecStartPre=/usr/bin/test -n "${GT_EXPECT_ACL}"
+# -heartbeat-max-age has no default and must exceed -cadence (parseFlags
+# refuses otherwise). -cadence 10 and -heartbeat-max-age 30s are the contract
+# in the README. -tick-max-age (how old the proxy's newest tick line may be)
+# is left at its default, 30s, above --ring-tick's default 5s. The other
+# flags are the baked defaults, written out.
+# -slot-owners is the account each member runs as, the User= of each
+# member's unit: an entry of this member's own halts/ named for a member
+# must be owned by that account (SPEC 10.2 H7), which is what makes a slot
+# created under another member's name the owner's own failing check (I8)
+# rather than a silent halt.
+# check-units.sh --static requires the mapping to equal the units' User=.
+ExecStart=/usr/local/bin/ghostunnel-obs-tunnel \
+    -identity tunnel \
+    -members tunnel,admin,material,super \
+    -coordinator super \
+    -copy-authors tunnel=material,admin=tunnel,material=admin \
+    -slot-owners tunnel=gtobs-tunnel,admin=gtobs-admin,material=gtobs-material,super=gtobs-super \
+    -stores /var/lib/ghostunnel-ring/stores \
+    -traces /var/lib/ghostunnel-ring/stores/gt \
+    -window 4 \
+    -min-cycle 300ms \
+    -cadence 10 \
+    -heartbeat-max-age 30s \
+    -expect-listen ${GT_EXPECT_LISTEN} \
+    -expect-target ${GT_EXPECT_TARGET} \
+    -expect-acl ${GT_EXPECT_ACL} \
+    -expect-proxy-protocol=${GT_EXPECT_PROXY_PROTOCOL} \
+    -policy-query=${GT_EXPECT_POLICY_QUERY}
+Restart=on-failure
+RestartSec=2s
+
+# ---- sandbox ----------------------------------------------------------------
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+# The observers open no sockets (their checks read the trace, not the port).
+PrivateNetwork=yes
+# boot-ambiguous stats /proc/<pid> of the process each boot's start line
+# names. ProtectProc=invisible would hide every other user's process from
+# this unit, ghostunnel's included, and the check reads a hidden pid as a
+# dead one; the highest boot's pid then reads dead every cycle and the
+# member halts. default keeps the process table readable. check-units.sh
+# requires it on the three members that run the check.
+ProtectProc=default
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+# The whole tree read-only; the lines below are the only exceptions.
+ReadOnlyPaths=/var/lib/ghostunnel-ring/stores
+# Own store: heartbeat/<seq>.hb and .tmp, fault, halt and their .tmp, and the
+# own-store-writable probe in heartbeat/. (row: tunnel)
+ReadWritePaths=/var/lib/ghostunnel-ring/stores/tunnel
+# The one peer copy tunnel authors: copy-authors admin=tunnel. (row: admin/copy)
+ReadWritePaths=/var/lib/ghostunnel-ring/stores/admin/copy
+# tunnel's own copy in the coordinator's store. (row: super/copy-tunnel)
+ReadWritePaths=/var/lib/ghostunnel-ring/stores/super/copy-tunnel
+# The halts/ of every other member: only the slot halts/tunnel and its .tmp,
+# narrowed by the sticky bit and file ownership. (rows: */halts)
+ReadWritePaths=/var/lib/ghostunnel-ring/stores/admin/halts
+ReadWritePaths=/var/lib/ghostunnel-ring/stores/material/halts
+ReadWritePaths=/var/lib/ghostunnel-ring/stores/super/halts
+# Inside the own store, the three directories other members write: remasked
+# read-only so the namespace grant is as exact as the DAC (more specific path
+# wins, systemd.exec(5)).
+ReadOnlyPaths=/var/lib/ghostunnel-ring/stores/tunnel/copy
+ReadOnlyPaths=/var/lib/ghostunnel-ring/stores/tunnel/copy-super
+ReadOnlyPaths=/var/lib/ghostunnel-ring/stores/tunnel/halts
+
+[Install]
+WantedBy=ghostunnel-ring.target

@@ -29,6 +29,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -192,25 +193,25 @@ func TestStatusHandlerStopping(t *testing.T) {
 
 func TestStatusHandlerResponses(t *testing.T) {
 	handler := newStatusHandler(dummyDial, "", "", "", "")
-	resp := handler.status(context.Background())
+	resp := handler.status(context.Background(), true)
 	if resp.Message != "initializing" {
 		t.Error("status should say 'initializing' on startup")
 	}
 
 	handler.Listening()
-	resp = handler.status(context.Background())
+	resp = handler.status(context.Background(), true)
 	if resp.Message != "listening" {
 		t.Error("status should say 'listening' after startup")
 	}
 
 	handler.Reloading()
-	resp = handler.status(context.Background())
+	resp = handler.status(context.Background(), true)
 	if resp.Message != "reloading" {
 		t.Error("status should say 'reloading' when reload initiated")
 	}
 
 	handler.Stopping()
-	resp = handler.status(context.Background())
+	resp = handler.status(context.Background(), true)
 	if resp.Message != "stopping" {
 		t.Error("status should say 'stopping' when shutdown initiated")
 	}
@@ -268,8 +269,12 @@ func TestServeHTTPBackendUnhealthy(t *testing.T) {
 	handler := newStatusHandler(dummyDialError, "", "", "", "")
 	handler.Listening()
 
+	// The backend error text is part of the detailed view, which is only
+	// served to a caller with a verified client certificate.
+	request := httptest.NewRequest(http.MethodGet, "/", nil)
+	request.TLS = verifiedClientTLS()
 	response := httptest.NewRecorder()
-	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/", nil))
+	handler.ServeHTTP(response, request)
 
 	if response.Code != http.StatusServiceUnavailable {
 		t.Errorf("expected status 503, got %d", response.Code)
@@ -320,7 +325,7 @@ func TestHandleWatchdogCallsSystemd(t *testing.T) {
 	handler := newStatusHandler(dummyDial, "", "", "", "")
 	handler.Listening()
 	// HandleWatchdog should not panic regardless of platform
-	handler.HandleWatchdog()
+	handler.HandleWatchdog(func() bool { return true })
 }
 
 // TestCheckBackendStatusInvalidURL covers the early-return error path in
@@ -397,7 +402,7 @@ func TestStoppingIsTerminal(t *testing.T) {
 		t.Error("stopping must remain true after a late Listening()")
 	}
 
-	resp := handler.status(context.Background())
+	resp := handler.status(context.Background(), true)
 	if resp.Ok {
 		t.Error("expected resp.Ok=false after Stopping() even if Listening() fires again")
 	}
@@ -422,7 +427,78 @@ func TestReloadingNoOpAfterStopping(t *testing.T) {
 	if handler.reloading {
 		t.Error("Reloading() after Stopping() must not set reloading=true")
 	}
-	if resp := handler.status(context.Background()); resp.Message != "stopping" {
+	if resp := handler.status(context.Background(), true); resp.Message != "stopping" {
 		t.Errorf("expected message %q after Reloading() during stop, got %q", "stopping", resp.Message)
+	}
+}
+
+// TestStatusAnonymousGetsSummaryOnly verifies that a request without a
+// verified client certificate receives the health summary only. The listen
+// and forward addresses, backend error text, hostname, revision, compiler and
+// reload time are served only to a caller the status listener authenticated.
+func TestStatusAnonymousGetsSummaryOnly(t *testing.T) {
+	handler := newStatusHandler(dummyDialError, "", "10.0.0.5:8443", "backend.internal:8080", "")
+	handler.Listening()
+	handler.Reloading()
+	handler.Listening()
+
+	anon := httptest.NewRecorder()
+	handler.ServeHTTP(anon, httptest.NewRequest(http.MethodGet, "/_status", nil))
+	if anon.Code != http.StatusServiceUnavailable {
+		t.Errorf("expected 503 for a failing backend, got %d", anon.Code)
+	}
+	body := anon.Body.String()
+	for _, detail := range []string{"10.0.0.5:8443", "backend.internal:8080", "listen_address", "forward_address", "backend_error", "hostname", "revision", "compiler", "last_reload"} {
+		if strings.Contains(body, detail) {
+			t.Errorf("anonymous status response must not include %q, got %s", detail, body)
+		}
+	}
+	var resp statusResponse
+	if err := json.Unmarshal(anon.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to unmarshal response body: %v", err)
+	}
+	if resp.Ok || resp.BackendOk || resp.Status != "critical" || resp.Message != "listening" {
+		t.Errorf("anonymous response should still carry the health summary, got %+v", resp)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/_status", nil)
+	req.TLS = verifiedClientTLS()
+	auth := httptest.NewRecorder()
+	handler.ServeHTTP(auth, req)
+	body = auth.Body.String()
+	for _, detail := range []string{"10.0.0.5:8443", "backend.internal:8080", "backend_error", "revision", "compiler", "last_reload"} {
+		if !strings.Contains(body, detail) {
+			t.Errorf("authenticated status response should include %q, got %s", detail, body)
+		}
+	}
+}
+
+// TestStatusAnonymousBackendProbeIsBounded verifies that requests without a
+// verified client certificate cannot drive the backend probe at will: within
+// one interval they share a single probe, while an authenticated caller gets
+// a fresh probe on demand.
+func TestStatusAnonymousBackendProbeIsBounded(t *testing.T) {
+	var probes int32
+	dial := func(ctx context.Context) (net.Conn, error) {
+		atomic.AddInt32(&probes, 1)
+		return dummyDial(ctx)
+	}
+	handler := newStatusHandler(dial, "", "", "", "")
+	handler.Listening()
+
+	for range 3 {
+		handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/_status", nil))
+	}
+	if got := atomic.LoadInt32(&probes); got != 1 {
+		t.Errorf("anonymous requests should share one backend probe per interval, got %d probes", got)
+	}
+
+	for range 2 {
+		req := httptest.NewRequest(http.MethodGet, "/_status", nil)
+		req.TLS = verifiedClientTLS()
+		handler.ServeHTTP(httptest.NewRecorder(), req)
+	}
+	if got := atomic.LoadInt32(&probes); got != 3 {
+		t.Errorf("authenticated requests should each probe the backend, got %d probes", got)
 	}
 }

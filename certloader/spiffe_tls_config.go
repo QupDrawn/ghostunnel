@@ -167,5 +167,6 @@ func (c *spiffeTLSConfig) buildServerConfig() *tls.Config {
 	config.InsecureSkipVerify = true
 	config.VerifyPeerCertificate = spiffeConfig.WrapVerifyPeerCertificate(config.VerifyPeerCertificate, c.source, spiffeConfig.AuthorizeAny())
 	config.GetCertificate = spiffeConfig.GetCertificate(c.source)
+	reverifyResumedSessions(config)
 	return config
 }

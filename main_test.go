@@ -18,6 +18,7 @@ package main
 
 import (
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"errors"
 	"net"
@@ -32,8 +33,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ghostunnel/ghostunnel/auth"
 	"github.com/ghostunnel/ghostunnel/certloader"
 	"github.com/ghostunnel/ghostunnel/proxy"
+	"github.com/ghostunnel/ghostunnel/ringtrace"
 	"github.com/stretchr/testify/assert"
 	netproxy "golang.org/x/net/proxy"
 )
@@ -159,6 +162,8 @@ func TestServerFlagValidation(t *testing.T) {
 		*serverProxyProtocolMode = ""
 		*enabledCipherSuites = "AES,CHACHA"
 		decodedServerPins = nil
+		*ringTraces, *ringStores, *ringHeartbeatMaxAge, *ringTick = "traces", "stores", time.Second, 100*time.Millisecond
+		decideTestSandbox()
 	}
 	defer reset()
 
@@ -306,6 +311,9 @@ func TestClientFlagValidation(t *testing.T) {
 		*clientAllowQuery = ""
 		*clientVerifySpkiPin = nil
 		decodedClientPins = nil
+		*clientVerifyHostnameOnly = true
+		*ringTraces, *ringStores, *ringHeartbeatMaxAge, *ringTick = "traces", "stores", time.Second, 100*time.Millisecond
+		decideTestSandbox()
 	}
 	defer reset()
 
@@ -370,6 +378,7 @@ func TestClientFlagValidation(t *testing.T) {
 	reset()
 	*clientAllowPolicy = "policy"
 	*clientAllowQuery = "query"
+	*clientVerifyHostnameOnly = false // the policy is the rule; hostname-only is refused beside it
 	assert.Nil(t, clientValidateFlags(), "--verify-policy and --verify-query together should be valid")
 
 	reset()
@@ -425,6 +434,7 @@ func TestValidateServerSpkiPinParsing(t *testing.T) {
 	// access control flags (pin mode is mutually exclusive with them).
 	reset := func() {
 		*serverAllowSpkiPin = nil
+		*ringTraces, *ringStores, *ringHeartbeatMaxAge, *ringTick = "traces", "stores", time.Second, 100*time.Millisecond
 		*certPath = "server.crt"
 		*keyPath = "server.key"
 		*keystorePath = ""
@@ -444,6 +454,7 @@ func TestValidateServerSpkiPinParsing(t *testing.T) {
 		*serverProxyProtocol = false
 		*serverProxyProtocolMode = ""
 		decodedServerPins = nil
+		decideTestSandbox()
 	}
 	defer reset()
 
@@ -737,11 +748,22 @@ func TestInvalidCABundle(t *testing.T) {
 		"--listen", "localhost:8080",
 	}
 	if runtime.GOOS == "linux" {
-		// Disable landlock so we don't inadvertendly affect later unit tests.
-		cmd = append(cmd, "--disable-landlock")
+		// A sandbox other than applied refuses to start, and applying
+		// landlock here would confine the test process for the rest of the
+		// suite: pin the state applied through run's seam instead.
+		origDecide := decideSandbox
+		decideSandbox = func(bool) string { return ringtrace.SandboxApplied }
+		defer func() { decideSandbox = origDecide }()
+	} else {
+		// A build with no process sandbox starts only under an explicit
+		// acceptance; without it the run fails before the CA bundle is read.
+		cmd = append(cmd, "--accept-no-sandbox="+runtime.GOOS)
 	}
 	err := run(cmd)
 	assert.NotNil(t, err, "invalid CA bundle should exit with error")
+	if err != nil {
+		assert.NotContains(t, err.Error(), "sandbox", "the failure is the CA bundle's, not the sandbox rule's")
+	}
 }
 
 func TestProxyLoggingFlags(t *testing.T) {
@@ -1528,10 +1550,16 @@ func TestServerListenEarlyErrors(t *testing.T) {
 // does not exist exercises the failure inside socket.Open (after ParseAddress
 // succeeds), driving the err branch of clientListen.
 func TestClientListenSocketOpenFails(t *testing.T) {
-	orig := *clientListenAddress
-	t.Cleanup(func() { *clientListenAddress = orig })
+	orig, origTarget := *clientListenAddress, *clientForwardAddress
+	t.Cleanup(func() { *clientListenAddress, *clientForwardAddress = orig, origTarget })
+	// The ring opens before the listener binds, so give it a tree and no
+	// material files to read; the failure under test is the socket's.
+	t.Cleanup(saveRingFlags())
+	*certPath, *keyPath, *caBundlePath = "", "", ""
+	*ringTraces, *ringStores, *ringHeartbeatMaxAge, *ringTick = t.TempDir(), t.TempDir(), time.Second, 100*time.Millisecond
 
 	*clientListenAddress = "unix:/nonexistent/dir/sock.sock"
+	*clientForwardAddress = "127.0.0.1:8080"
 
 	err := clientListen(&Environment{})
 	assert.NotNil(t, err, "expected error for invalid socket address")
@@ -1686,14 +1714,32 @@ func TestShutdownHandlerRejectsNonPost(t *testing.T) {
 	}
 }
 
-// TestShutdownHandlerSignalsOnce verifies that a POST signals the shutdown
-// channel exactly once and returns 200 OK.
+// verifiedClientTLS returns the connection state of a request whose client
+// certificate the status listener verified, which /_shutdown requires.
+func verifiedClientTLS() *tls.ConnectionState {
+	return &tls.ConnectionState{
+		PeerCertificates: []*x509.Certificate{{}},
+		VerifiedChains:   [][]*x509.Certificate{{{}}},
+	}
+}
+
+// allowAllRing is a server-mode ring whose tunnel ACL allows every verified
+// caller, which /_shutdown holds its callers to after the certificate
+// check; these tests are about the certificate check and the signalling.
+func allowAllRing() *ring {
+	return &ring{mode: "server", acl: auth.ACL{AllowAll: true}, verifier: true}
+}
+
+// TestShutdownHandlerSignalsOnce verifies that an authenticated POST signals
+// the shutdown channel exactly once and returns 200 OK.
 func TestShutdownHandlerSignalsOnce(t *testing.T) {
 	env := &Environment{
 		shutdownChannel: make(chan bool, 1),
+		ring:            allowAllRing(),
 	}
 
 	req := httptest.NewRequest(http.MethodPost, "/_shutdown", nil)
+	req.TLS = verifiedClientTLS()
 	rec := httptest.NewRecorder()
 	env.shutdownHandler(rec, req)
 
@@ -1718,6 +1764,7 @@ func TestShutdownHandlerConcurrentPosts(t *testing.T) {
 		// it, so after the first send the buffer is full and a blocking
 		// send would deadlock.
 		shutdownChannel: make(chan bool, 1),
+		ring:            allowAllRing(),
 	}
 
 	const concurrent = 16
@@ -1735,6 +1782,7 @@ func TestShutdownHandlerConcurrentPosts(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			req := httptest.NewRequest(http.MethodPost, "/_shutdown", nil)
+			req.TLS = verifiedClientTLS()
 			rec := httptest.NewRecorder()
 			env.shutdownHandler(rec, req)
 			assert.Equal(t, http.StatusOK, rec.Code)
@@ -1821,4 +1869,164 @@ default allow := true
 			}
 		})
 	}
+}
+
+// TestPprofCmdlineRedactsValues verifies that /debug/pprof/cmdline does not
+// echo command-line values. Secrets such as --storepass or --pkcs11-pin may be
+// passed as flags, and the status port is reachable without a client
+// certificate, so only the program path and flag names may be served.
+func TestPprofCmdlineRedactsValues(t *testing.T) {
+	origArgs := os.Args
+	origProf := *enableProf
+	defer func() {
+		os.Args = origArgs
+		*enableProf = origProf
+	}()
+	os.Args = []string{
+		"ghostunnel",
+		"--storepass=s3cretpass",
+		"--keystore", "/etc/ghostunnel/private.p12",
+		"server",
+		"--listen", "internal-host:8443",
+		"--allow-cn", "alice",
+	}
+	*enableProf = true
+
+	env := &Environment{}
+	req := httptest.NewRequest(http.MethodGet, "/debug/pprof/cmdline", nil)
+	// The endpoint acts only for a verified client certificate; this test
+	// is about what such a caller is served.
+	leaf := &x509.Certificate{}
+	req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{leaf}, VerifiedChains: [][]*x509.Certificate{{leaf}}}
+	rec := httptest.NewRecorder()
+	env.statusMux().ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+	body := rec.Body.String()
+	for _, secret := range []string{"s3cretpass", "/etc/ghostunnel/private.p12", "internal-host:8443", "alice"} {
+		assert.NotContains(t, body, secret, "command-line value must not be served")
+	}
+	for _, name := range []string{"ghostunnel", "--storepass", "--keystore", "--listen", "--allow-cn"} {
+		assert.Contains(t, body, name, "program path and flag names should still be served")
+	}
+}
+
+// TestRedactCmdline covers the argument shapes kingpin accepts.
+func TestRedactCmdline(t *testing.T) {
+	known := knownFlagNames(app.Model())
+	assert.True(t, known["--storepass"], "app flags should be known")
+	assert.True(t, known["--allow-cn"], "command flags should be known")
+	assert.True(t, known["--no-enable-pprof"], "boolean flags should be known in their --no- form")
+
+	got := redactCmdline([]string{
+		"/usr/bin/ghostunnel",
+		"--storepass=s3cret",
+		"--storepass", "s3cret",
+		"--not-a-flag=value",
+		"server",
+		"--allow-cn", "alice",
+		"--quiet",
+		"--proxy=https://user:pw@proxy.example.com",
+		"-x",
+	}, known)
+	assert.Equal(t, []string{
+		"/usr/bin/ghostunnel",
+		"--storepass=<redacted>",
+		"--storepass", "<redacted>",
+		"<redacted>",
+		"<redacted>",
+		"--allow-cn", "<redacted>",
+		"--quiet",
+		"--proxy=<redacted>",
+		"<redacted>",
+	}, got)
+}
+
+// TestShutdownRequiresVerifiedClientCert verifies that /_shutdown only acts
+// on a request whose TLS client certificate was verified by the status
+// listener. Anyone able to reach the status port could otherwise stop the
+// proxy with a single POST.
+func TestShutdownRequiresVerifiedClientCert(t *testing.T) {
+	origShutdown := *enableShutdown
+	defer func() { *enableShutdown = origShutdown }()
+	*enableShutdown = true
+
+	cases := []struct {
+		name     string
+		tls      *tls.ConnectionState
+		wantCode int
+		signals  bool
+	}{
+		{name: "plaintext", tls: nil, wantCode: http.StatusForbidden},
+		{name: "tls without client cert", tls: &tls.ConnectionState{}, wantCode: http.StatusForbidden},
+		{
+			name: "tls with unverified client cert",
+			tls: &tls.ConnectionState{
+				PeerCertificates: []*x509.Certificate{{}},
+			},
+			wantCode: http.StatusForbidden,
+		},
+		{
+			name: "tls with verified client cert",
+			tls: &tls.ConnectionState{
+				PeerCertificates: []*x509.Certificate{{}},
+				VerifiedChains:   [][]*x509.Certificate{{{}}},
+			},
+			wantCode: http.StatusOK,
+			signals:  true,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			env := &Environment{shutdownChannel: make(chan bool, 1), ring: allowAllRing()}
+			req := httptest.NewRequest(http.MethodPost, "/_shutdown", nil)
+			req.TLS = c.tls
+			rec := httptest.NewRecorder()
+			env.statusMux().ServeHTTP(rec, req)
+
+			assert.Equal(t, c.wantCode, rec.Code)
+			select {
+			case <-env.shutdownChannel:
+				assert.True(t, c.signals, "request must not signal shutdown")
+			default:
+				assert.False(t, c.signals, "request should have signalled shutdown")
+			}
+		})
+	}
+}
+
+// TestServeStatusShutdownNeedsTLSListener verifies that --enable-shutdown is
+// refused at startup when the status listener cannot verify a client
+// certificate, i.e. whenever it serves plain HTTP.
+func TestServeStatusShutdownNeedsTLSListener(t *testing.T) {
+	origStatus := *statusAddress
+	origShutdown := *enableShutdown
+	defer func() {
+		*statusAddress = origStatus
+		*enableShutdown = origShutdown
+	}()
+	*statusAddress = "http://127.0.0.1:0"
+	*enableShutdown = true
+
+	env := &Environment{shutdownChannel: make(chan bool, 1), ring: allowAllRing()}
+	err := env.serveStatus()
+	if env.statusHTTP != nil {
+		env.statusHTTP.Close()
+	}
+	assert.NotNil(t, err, "shutdown endpoint must not be served on a plaintext status listener")
+}
+
+// TestWarmPoolSizeDefault: the default pool is for a remote server-mode
+// target alone; an explicit value, zero included, is taken as given.
+func TestWarmPoolSizeDefault(t *testing.T) {
+	assert.Equal(t, defaultWarmBackendConnections, warmPoolSize(-1, "server", "10.0.0.5:8080"))
+	assert.Equal(t, defaultWarmBackendConnections, warmPoolSize(-1, "server", "backend.internal:8080"))
+	assert.Equal(t, 0, warmPoolSize(-1, "server", "localhost:8080"))
+	assert.Equal(t, 0, warmPoolSize(-1, "server", "127.0.0.1:8080"))
+	assert.Equal(t, 0, warmPoolSize(-1, "server", "[::1]:8080"))
+	assert.Equal(t, 0, warmPoolSize(-1, "server", "unix:/run/backend.sock"))
+	assert.Equal(t, 0, warmPoolSize(-1, "client", "10.0.0.5:443"))
+	assert.Equal(t, 0, warmPoolSize(0, "server", "10.0.0.5:8080"))
+	assert.Equal(t, 8, warmPoolSize(8, "client", "10.0.0.5:443"))
+	assert.Equal(t, 64, warmPoolSize(64, "server", "localhost:8080"))
 }

@@ -1,0 +1,9 @@
+# The observer ring's fixture oracle is hashed byte for byte: every heartbeat,
+# copy, fault and halt file's SHA-256 (trailing line feed included) is what its
+# successors and its readers record, and several files are deliberately
+# malformed. Git must never convert line endings in either direction here.
+observers/testdata/** -text
+
+# The deployment runs on a Linux host: shell scripts, systemd units and the
+# example environment file must check out with line feeds everywhere.
+deploy/** text eol=lf

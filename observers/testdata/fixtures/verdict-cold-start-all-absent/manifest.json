@@ -1,0 +1,84 @@
+{
+    "fixture": "verdict-cold-start-all-absent",
+    "description": "Cold start of the whole ring seen from tunnel: no member has a heartbeat folder. Every verdict is absent, member-present fails for each, and the halt names the first in identity order.",
+    "rules": [
+        "SPEC 7",
+        "SPEC 8.1 V2"
+    ],
+    "reader": "tunnel",
+    "reader_booted": true,
+    "parameters": {
+        "window": 4,
+        "stale_slack_cycles": 1,
+        "staging_stale_after_seconds": 60,
+        "max_heartbeat_bytes": 8192,
+        "max_fault_bytes": 8192,
+        "max_halt_bytes": 8192,
+        "now": "2026-09-20T10:07:25Z"
+    },
+    "directories": [
+        "stores/admin",
+        "stores/admin/copy",
+        "stores/admin/copy-super",
+        "stores/admin/copy/heartbeat",
+        "stores/admin/halts",
+        "stores/material",
+        "stores/material/copy",
+        "stores/material/copy-super",
+        "stores/material/copy/heartbeat",
+        "stores/material/halts",
+        "stores/super",
+        "stores/super/copy-admin",
+        "stores/super/copy-admin/heartbeat",
+        "stores/super/copy-material",
+        "stores/super/copy-material/heartbeat",
+        "stores/super/copy-tunnel",
+        "stores/super/copy-tunnel/heartbeat",
+        "stores/super/halts",
+        "stores/tunnel",
+        "stores/tunnel/copy",
+        "stores/tunnel/copy-super",
+        "stores/tunnel/copy/heartbeat",
+        "stores/tunnel/halts"
+    ],
+    "expect": {
+        "verdicts": {
+            "admin": "absent",
+            "material": "absent",
+            "super": "absent"
+        },
+        "failing": [
+            {
+                "check": "member-present",
+                "subject": "admin"
+            },
+            {
+                "check": "member-present",
+                "subject": "material"
+            },
+            {
+                "check": "member-present",
+                "subject": "super"
+            }
+        ],
+        "halt_in_force_before": false,
+        "halt": {
+            "writes": true,
+            "reason": "member-present",
+            "subject": "admin"
+        },
+        "publish": {
+            "sequence": 1,
+            "previous": null,
+            "observed": {
+                "admin": null,
+                "material": null,
+                "super": null
+            },
+            "boot": {
+                "resumed_from": null
+            },
+            "stop": false
+        }
+    }
+}

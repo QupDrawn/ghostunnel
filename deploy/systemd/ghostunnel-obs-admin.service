@@ -1,0 +1,92 @@
+# ghostunnel-obs-admin.service: the admin member, as user gtobs-admin.
+# Its writes are exactly the gtobs-admin rows of deploy/write-matrix.tsv.
+#
+# This unit differs from the other three in one line: ProtectProc=default.
+# The admin observer's cmdline-carries-no-secret reads /proc/<pid>/cmdline of
+# ghostunnel (pid from the start line) and fails closed if it cannot. Under
+# ProtectProc=invisible the unit's /proc would hide every other user's
+# process, so it stays default here. The same applies to the host's /proc:
+# it must not be mounted with hidepid=1 or 2 unless gid= names a group that
+# gtobs-admin is in (README, "hidepid"). check-units.sh --tree warns.
+[Unit]
+Description=ghostunnel observer ring: admin member
+Documentation=file:///usr/share/doc/ghostunnel-ring/README.md
+PartOf=ghostunnel-ring.target
+After=local-fs.target
+
+[Service]
+Type=simple
+User=gtobs-admin
+Group=gtobs-admin
+# Supplementary groups from /etc/group (setup-tree.sh): gtring-halts-tunnel,
+# gtring-halts-material, gtring-halts-super, gtring-pem.
+# gt/ is gt:gtring-trace 0750 (tree.tsv): the trace is read through this
+# group and by nobody outside it. Stated here so check-units.sh --static can
+# refuse a unit without it (see ghostunnel-obs-tunnel.service).
+SupplementaryGroups=gtring-trace
+UMask=0022
+# observers.env for GT_EXPECT_POLICY_QUERY alone: every member re-judges
+# the tunnel surface, so the policy query is one value on all four. It is
+# the operator's expectation, never the proxy's own file. Passed with = so an empty
+# value (no policy deployed) cannot shift the next flag into its place.
+EnvironmentFile=/etc/ghostunnel/observers.env
+# -slot-owners is the account each member runs as, the User= of each
+# member's unit: an entry of this member's own halts/ named for a member
+# must be owned by that account (SPEC 10.2 H7), which is what makes a slot
+# created under another member's name the owner's own failing check (I8)
+# rather than a silent halt.
+# check-units.sh --static requires the mapping to equal the units' User=.
+ExecStart=/usr/local/bin/ghostunnel-obs-admin \
+    -identity admin \
+    -members tunnel,admin,material,super \
+    -coordinator super \
+    -copy-authors tunnel=material,admin=tunnel,material=admin \
+    -slot-owners tunnel=gtobs-tunnel,admin=gtobs-admin,material=gtobs-material,super=gtobs-super \
+    -stores /var/lib/ghostunnel-ring/stores \
+    -traces /var/lib/ghostunnel-ring/stores/gt \
+    -proc /proc \
+    -window 4 \
+    -min-cycle 300ms \
+    -cadence 10 \
+    -heartbeat-max-age 30s \
+    -policy-query=${GT_EXPECT_POLICY_QUERY}
+Restart=on-failure
+RestartSec=2s
+
+# ---- sandbox ----------------------------------------------------------------
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+# The admin observer parses the status address; it opens no socket.
+PrivateNetwork=yes
+# Must see ghostunnel's /proc/<pid>/cmdline; see the header comment.
+ProtectProc=default
+ProcSubset=all
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+ReadOnlyPaths=/var/lib/ghostunnel-ring/stores
+# Own store. (row: admin)
+ReadWritePaths=/var/lib/ghostunnel-ring/stores/admin
+# The one peer copy admin authors: copy-authors material=admin. (row: material/copy)
+ReadWritePaths=/var/lib/ghostunnel-ring/stores/material/copy
+# admin's own copy in the coordinator's store. (row: super/copy-admin)
+ReadWritePaths=/var/lib/ghostunnel-ring/stores/super/copy-admin
+# The halts/ of every other member: only the slot halts/admin and its .tmp.
+ReadWritePaths=/var/lib/ghostunnel-ring/stores/tunnel/halts
+ReadWritePaths=/var/lib/ghostunnel-ring/stores/material/halts
+ReadWritePaths=/var/lib/ghostunnel-ring/stores/super/halts
+# Other members' directories inside the own store, remasked read-only.
+ReadOnlyPaths=/var/lib/ghostunnel-ring/stores/admin/copy
+ReadOnlyPaths=/var/lib/ghostunnel-ring/stores/admin/copy-super
+ReadOnlyPaths=/var/lib/ghostunnel-ring/stores/admin/halts
+
+[Install]
+WantedBy=ghostunnel-ring.target

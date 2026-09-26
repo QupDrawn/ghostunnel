@@ -30,3 +30,13 @@ website/static/pagefind/
 public/
 .claude
 .hugo_build.lock
+
+# Binaries a plain go build leaves beside each main package of the fork.
+*.exe
+/observers/tunnel/tunnel
+/observers/admin/admin
+/observers/material/material
+/observers/super/super
+/observers/ringstatus/ringstatus
+/bench/bench
+/bench/box/box

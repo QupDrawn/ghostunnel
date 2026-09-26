@@ -18,7 +18,9 @@ package certloader
 
 import (
 	"crypto/tls"
+	"errors"
 	"net"
+	"time"
 )
 
 // Listener holds a *net.Listener, wrapping incoming connections in TLS,
@@ -46,4 +48,14 @@ func (l *Listener) Accept() (net.Conn, error) {
 		return nil, err
 	}
 	return tls.Server(c, l.config.GetServerConfig()), nil
+}
+
+// SetDeadline bounds Accept on the wrapped listener, when that listener
+// supports a deadline (net.TCPListener and net.UnixListener do); otherwise
+// it is an error, so a caller that relies on the deadline can tell.
+func (l *Listener) SetDeadline(t time.Time) error {
+	if dl, ok := l.Listener.(interface{ SetDeadline(time.Time) error }); ok {
+		return dl.SetDeadline(t)
+	}
+	return errors.New("certloader: the wrapped listener has no deadline")
 }

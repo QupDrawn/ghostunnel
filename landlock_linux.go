@@ -28,9 +28,38 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/ghostunnel/ghostunnel/ringtrace"
 	"github.com/landlock-lsm/go-landlock/landlock"
 	llsys "github.com/landlock-lsm/go-landlock/landlock/syscall"
 )
+
+// setupSandbox is the process sandbox attempt on Linux, where the facility
+// is landlock. It reports the outcome the start line records: disabled
+// under --disable-landlock, skipped when PKCS#11 is in use (landlock is not
+// applied alongside it), applied when the rules were installed and the
+// kernel enforces them, and failed when setupLandlock errored or the kernel
+// has no landlock (best-effort setup then restricted nothing). A failure
+// does not stop the process here; the start line carries it for the ring
+// to judge. Older kernels have no landlock, and net rules need 6.7.
+func setupSandbox(pkcs11Enabled bool) string {
+	if disableLandlock != nil && *disableLandlock {
+		return ringtrace.SandboxDisabled
+	}
+	if pkcs11Enabled {
+		logger.Printf("note: using pkcs11, skipping landlock setup (landlock is not compatible with pkcs11)")
+		return ringtrace.SandboxSkipped
+	}
+	logger.Printf("setting up landlock rules to limit process privileges")
+	if err := setupLandlock(); err != nil {
+		logger.Printf("warning: unable to set up landlock: %v", err)
+		return ringtrace.SandboxFailed
+	}
+	if !landlockSupported() {
+		logger.Printf("warning: the kernel does not enforce landlock; nothing was restricted")
+		return ringtrace.SandboxFailed
+	}
+	return ringtrace.SandboxApplied
+}
 
 type portRuleFunc = func(port uint16) landlock.NetRule
 
@@ -176,6 +205,19 @@ func setupLandlock() error {
 			continue
 		}
 		fsRules = append(fsRules, rulesFromFile(*path)...)
+	}
+
+	// The observer ring. The trace root is written to: the emitter creates a
+	// boot directory and appends segments under it, so it needs RW. No
+	// IgnoreIfMissing, as for unix sockets above: the ring is mandatory and
+	// a missing trace root is a misconfiguration to fail loud on. The store
+	// tree is only ever read by the gate, which refuses on its own if the
+	// tree is missing, so RO with IgnoreIfMissing is enough there.
+	if ringTraces != nil && *ringTraces != "" {
+		fsRules = append(fsRules, landlock.RWDirs(*ringTraces))
+	}
+	if ringStores != nil && *ringStores != "" {
+		fsRules = append(fsRules, landlock.RODirs(*ringStores).IgnoreIfMissing())
 	}
 
 	// Process net.TCPAddr flags.
@@ -402,4 +444,12 @@ func certmagicDataDir() string {
 		home = "."
 	}
 	return filepath.Join(home, ".local", "share", "certmagic")
+}
+
+// landlockSupported reports whether the kernel enforces landlock at all.
+// setupLandlock runs in best-effort mode, which restricts nothing and
+// reports no error on a kernel without landlock; this tells the two apart.
+func landlockSupported() bool {
+	abiVersion, err := llsys.LandlockGetABIVersion()
+	return err == nil && abiVersion >= 1
 }

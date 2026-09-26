@@ -26,6 +26,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -155,6 +156,31 @@ type Proxy struct {
 	Dial DialFunc
 	// Logger is used to log information messages about connections, errors.
 	Logger Logger
+	// Observer, when set, is told about every accepted connection and may
+	// refuse it before it is served. Nil (the default) changes nothing.
+	Observer Observer
+
+	// CopyBufferSize is the size in bytes of each buffer the copy loops
+	// move bytes with, one per direction per connection, drawn from a pool.
+	// Zero means DefaultCopyBufferSize. It changes only how many bytes each
+	// read and write moves, never which bytes go where. Set before Accept.
+	CopyBufferSize int
+	// SocketBufferSize, when positive, is set as the kernel send and
+	// receive buffer size (SO_SNDBUF and SO_RCVBUF) on every accepted
+	// client socket and every backend socket. Zero (the default) leaves
+	// the operating system's default. Set before Accept.
+	SocketBufferSize int
+	// WarmBackendConnections, when positive, keeps up to this many
+	// pre-dialed connections to the backend open and idle, so that a
+	// served connection takes one instead of dialing on its own path; the
+	// pool refills in the background. Zero (the default) dials for every
+	// connection. See warmpool.go for what the backend observes.
+	// Set before Accept.
+	WarmBackendConnections int
+	// WarmBackendIdle is how long a pooled backend connection may stay
+	// idle before it is closed and replaced. Zero means
+	// DefaultWarmBackendIdle. Set before Accept.
+	WarmBackendIdle time.Duration
 
 	// Logging flags
 	loggerFlags int
@@ -175,9 +201,132 @@ type Proxy struct {
 	shutdownOnce sync.Once
 	// Pool for buffers
 	pool sync.Pool
+	// warm is the pool of pre-dialed backend connections, started by Accept
+	// when WarmBackendConnections is positive, else nil.
+	warmMu sync.Mutex
+	warm   *warmPool
 	// Metrics handles for the connection hot path. Either live (recording to a
 	// registry) or no-op (NilMetrics) when no metrics sink is configured.
 	metrics *Metrics
+	// live is every connection accepted and not yet closed, so that CloseAll
+	// can end all of them at once.
+	liveMu sync.Mutex
+	live   map[*liveConn]struct{}
+	// lastIteration is when the accept loop last came round (unix
+	// nanoseconds, 0 before it first ran), and listenerClosed is set for
+	// good once Accept reported the listener closed: the two facts a health
+	// check reads.
+	lastIteration  atomic.Int64
+	listenerClosed atomic.Bool
+}
+
+// LastIteration is when the accept loop last came round, or the zero time
+// before it first ran. The loop bounds every wait by acceptDeadline, so a
+// healthy loop comes round at least that often with nothing to accept.
+func (p *Proxy) LastIteration() time.Time {
+	ns := p.lastIteration.Load()
+	if ns == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, ns)
+}
+
+// ListenerClosed reports whether Accept has returned net.ErrClosed, which
+// is for good, other than through Shutdown.
+func (p *Proxy) ListenerClosed() bool {
+	return p.listenerClosed.Load()
+}
+
+// ShuttingDown reports whether Shutdown has been called.
+func (p *Proxy) ShuttingDown() bool {
+	return p.context.Err() != nil
+}
+
+// liveConn is one accepted connection in the registry: the client side, the
+// backend side once dialed, and the reason CloseAll forced on it, if any,
+// which the handler reports in place of its own.
+type liveConn struct {
+	mu      sync.Mutex
+	client  net.Conn
+	backend net.Conn
+	forced  *CloseReason
+}
+
+// track registers an accepted connection until untrack.
+func (p *Proxy) track(client net.Conn) *liveConn {
+	c := &liveConn{client: client}
+	p.liveMu.Lock()
+	p.live[c] = struct{}{}
+	p.liveMu.Unlock()
+	return c
+}
+
+func (p *Proxy) untrack(c *liveConn) {
+	p.liveMu.Lock()
+	delete(p.live, c)
+	p.liveMu.Unlock()
+}
+
+// setBackend records the dialed backend; if the connection was already
+// forced closed in the meantime the backend is closed too, at once.
+func (c *liveConn) setBackend(backend net.Conn) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.backend = backend
+	if c.forced != nil {
+		_ = backend.Close()
+	}
+}
+
+// force closes both sides with the given reason. Closing is idempotent
+// against the connection's own close path: net.Conn.Close tolerates a
+// second call, and the handler reports the forced reason exactly once, in
+// its own Closed callback.
+func (c *liveConn) force(reason CloseReason) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.forced != nil {
+		return
+	}
+	c.forced = &reason
+	_ = c.client.Close()
+	if c.backend != nil {
+		_ = c.backend.Close()
+	}
+}
+
+// reason is the forced reason if CloseAll ended the connection, else the
+// handler's own.
+func (c *liveConn) reason(own CloseReason) CloseReason {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.forced != nil {
+		return *c.forced
+	}
+	return own
+}
+
+// CloseAll closes every connection accepted and not yet closed, at once,
+// and returns how many it closed. Each connection's observer is told the
+// given reason, once, when its handler ends. A connection accepted after
+// this call is not affected; the caller decides on it at accept.
+func (p *Proxy) CloseAll(reason CloseReason) int {
+	p.liveMu.Lock()
+	conns := make([]*liveConn, 0, len(p.live))
+	for c := range p.live {
+		conns = append(conns, c)
+	}
+	p.liveMu.Unlock()
+	for _, c := range conns {
+		c.force(reason)
+	}
+	// The pooled backend connections are ended too: they are not accepted
+	// connections, so they are not counted, and the pool stays empty until a
+	// connection is served again.
+	if w := p.warmPool(); w != nil {
+		w.drain(false)
+	}
+	return len(conns)
 }
 
 // PROXY protocol v2 client flag constants (from spec section 2.2.5).
@@ -312,6 +461,45 @@ func buildSSLTLV(state *tls.ConnectionState, mode ProxyProtocolMode) (proxyproto
 	return proxyproto.TLV{Type: proxyproto.PP2_TYPE_SSL, Value: value}, nil
 }
 
+// DefaultCopyBufferSize is the copy buffer size when CopyBufferSize is zero.
+// See BenchmarkBulkThroughput for the measurement it was chosen by.
+const DefaultCopyBufferSize = 64 << 10
+
+// copyBufferSize is the configured copy buffer size, or the default.
+func (p *Proxy) copyBufferSize() int {
+	if p.CopyBufferSize > 0 {
+		return p.CopyBufferSize
+	}
+	return DefaultCopyBufferSize
+}
+
+// setSocketBuffers applies SocketBufferSize, if set, to the socket under
+// conn: a TLS connection is unwrapped to the socket it runs on. A
+// connection that has no such buffers (a pipe, a test stub) is left alone.
+func (p *Proxy) setSocketBuffers(conn net.Conn) {
+	size := p.SocketBufferSize
+	if size <= 0 || conn == nil {
+		return
+	}
+	for {
+		inner, ok := conn.(interface{ NetConn() net.Conn })
+		if !ok {
+			break
+		}
+		next := inner.NetConn()
+		if next == nil || next == conn {
+			break
+		}
+		conn = next
+	}
+	if rb, ok := conn.(interface{ SetReadBuffer(int) error }); ok {
+		_ = rb.SetReadBuffer(size)
+	}
+	if wb, ok := conn.(interface{ SetWriteBuffer(int) error }); ok {
+		_ = wb.SetWriteBuffer(size)
+	}
+}
+
 // New creates a new proxy.
 func New(
 	listener net.Listener,
@@ -344,12 +532,11 @@ func New(
 		context:         ctx,
 		cancel:          cancel,
 		metrics:         connMetrics,
-		pool: sync.Pool{
-			New: func() any {
-				b := make([]byte, 1<<15 /* 32 KiB */)
-				return &b
-			},
-		},
+		live:            make(map[*liveConn]struct{}),
+	}
+	p.pool.New = func() any {
+		b := make([]byte, p.copyBufferSize())
+		return &b
 	}
 
 	if maxConcurrentConnections > 0 {
@@ -372,8 +559,53 @@ func (p *Proxy) Shutdown() {
 	p.shutdownOnce.Do(func() {
 		p.cancel()
 		p.Listener.Close()
+		if w := p.warmPool(); w != nil {
+			w.drain(true)
+		}
 		p.handlers.Done()
 	})
+}
+
+// startWarmPool starts the pool of pre-dialed backend connections if
+// WarmBackendConnections asks for one, once, and never after Shutdown.
+func (p *Proxy) startWarmPool() {
+	if p.WarmBackendConnections <= 0 || p.Dial == nil {
+		return
+	}
+	p.warmMu.Lock()
+	defer p.warmMu.Unlock()
+	if p.warm != nil || p.context.Err() != nil {
+		return
+	}
+	idle := p.WarmBackendIdle
+	if idle <= 0 {
+		idle = DefaultWarmBackendIdle
+	}
+	p.warm = newWarmPool(p, p.WarmBackendConnections, idle)
+}
+
+// warmPool is the running pool, or nil.
+func (p *Proxy) warmPool() *warmPool {
+	p.warmMu.Lock()
+	defer p.warmMu.Unlock()
+	return p.warm
+}
+
+// dialBackend is the backend connection for an accepted client: a pooled
+// one when the warm pool has a live one, else a fresh dial. Either way
+// the socket buffers are applied.
+func (p *Proxy) dialBackend(ctx context.Context) (net.Conn, error) {
+	if w := p.warmPool(); w != nil {
+		if conn := w.take(); conn != nil {
+			return conn, nil
+		}
+	}
+	conn, err := p.Dial(ctx)
+	if err != nil {
+		return nil, err
+	}
+	p.setSocketBuffers(conn)
+	return conn, nil
 }
 
 // Wait until the proxy is shut down (listener closed, connections drained).
@@ -390,6 +622,11 @@ const (
 	acceptBackoffMax = 1 * time.Second
 )
 
+// acceptDeadline bounds every wait in the accept loop (the semaphore and
+// Accept itself), so the loop comes round at least this often and
+// LastIteration says whether it is alive.
+const acceptDeadline = 1 * time.Second
+
 // Accept incoming connections and spawn Go routines to handle them and forward
 // the data to the backend. Will stop accepting connections if Shutdown() is called.
 // Run this in a Goroutine, call Wait() to block on proxy shutdown/connection drain.
@@ -400,12 +637,23 @@ func (p *Proxy) Accept() {
 	// prevents a hot loop on persistent errors like fd exhaustion (EMFILE).
 	var acceptBackoff time.Duration
 
+	p.startWarmPool()
+
 	for {
-		// Acquire semaphore, to limit max concurrent connections
-		err := p.connSemaphore.Acquire(p.context, 1)
+		p.lastIteration.Store(time.Now().UnixNano())
+
+		// Acquire semaphore, to limit max concurrent connections. The wait is
+		// bounded by acceptDeadline so the loop keeps coming round, and
+		// keeps saying so, while every slot is taken.
+		acquireCtx, cancelAcquire := context.WithTimeout(p.context, acceptDeadline)
+		err := p.connSemaphore.Acquire(acquireCtx, 1)
+		cancelAcquire()
 		if err != nil {
-			// Context was cancelled -- we're done here
-			return
+			if p.context.Err() != nil {
+				// Context was cancelled -- we're done here
+				return
+			}
+			continue
 		}
 
 		// Reserve the handler slot BEFORE the blocking Accept(). This guarantees
@@ -415,7 +663,12 @@ func (p *Proxy) Accept() {
 		// not-yet-registered connection is outstanding.
 		p.handlers.Add(1)
 
-		// Wait for new connection
+		// Wait for new connection, for at most acceptDeadline where the
+		// listener can be told so, so the loop comes round with nothing to
+		// accept.
+		if dl, ok := p.Listener.(interface{ SetDeadline(time.Time) error }); ok {
+			_ = dl.SetDeadline(time.Now().Add(acceptDeadline))
+		}
 		conn, err := p.Listener.Accept()
 		if err != nil {
 			// No connection to handle: release the reserved slot.
@@ -426,8 +679,16 @@ func (p *Proxy) Accept() {
 				return
 			}
 
-			p.metrics.ErrorCounter.Inc(1)
 			p.connSemaphore.Release(1)
+			if isTimeoutError(err) {
+				// The loop's own deadline: nothing to accept, nothing wrong.
+				continue
+			}
+			if errors.Is(err, net.ErrClosed) {
+				p.listenerClosed.Store(true)
+			}
+
+			p.metrics.ErrorCounter.Inc(1)
 			p.logConditional(LogConnectionErrors, "error accepting connection: %s", err)
 
 			// Back off before retrying so we don't spin at 100% CPU on
@@ -436,6 +697,9 @@ func (p *Proxy) Accept() {
 				acceptBackoff = acceptBackoffMin
 			} else {
 				acceptBackoff = min(acceptBackoff*2, acceptBackoffMax)
+			}
+			if p.Observer != nil {
+				p.Observer.AcceptError(err, acceptBackoff)
 			}
 			select {
 			case <-time.After(acceptBackoff):
@@ -460,20 +724,54 @@ func (p *Proxy) Accept() {
 			p.metrics.OpenCounter.Inc(1)
 			p.metrics.TotalCounter.Inc(1)
 
+			// The observer, if any, follows this connection; reason is why it
+			// ended, reported once the connection is closed, unless CloseAll
+			// ended it first, in which case its reason is reported instead.
+			var observer ConnObserver
+			reason := CloseEOF
+			live := p.track(conn)
 			defer func() {
 				conn.Close()
+				p.untrack(live)
 				p.metrics.OpenCounter.Dec(1)
 				p.handlers.Done()
 				p.connSemaphore.Release(1)
+				if observer != nil {
+					observer.Closed(live.reason(reason))
+				}
 			}()
+
+			p.setSocketBuffers(conn)
+
+			if p.Observer != nil {
+				var err error
+				observer, err = p.Observer.Accepted(conn)
+				if err != nil {
+					// Refused before anything was read: closed by the defer
+					// above, never dialed, and not followed any further.
+					observer = nil
+					p.metrics.ErrorCounter.Inc(1)
+					return
+				}
+			}
 
 			ctx, cancel := context.WithTimeout(p.context, p.ConnectTimeout)
 			defer cancel()
 
 			err := forceHandshake(ctx, conn, p.metrics)
+			if observer != nil {
+				if tlsConn, ok := conn.(*tls.Conn); ok {
+					state := tlsConn.ConnectionState()
+					observer.Handshake(&state, err)
+				}
+			}
 			if err != nil {
 				p.metrics.ErrorCounter.Inc(1)
 				p.logConditional(LogHandshakeErrors, "error on TLS handshake from %s: %s", conn.RemoteAddr(), err)
+				reason = CloseRefused
+				if p.context.Err() != nil {
+					reason = CloseShutdown
+				}
 				return
 			}
 
@@ -484,15 +782,39 @@ func (p *Proxy) Accept() {
 			// to proxy ensures that relaxation cannot become an mTLS bypass.
 			if isACMEChallengeConn(conn) {
 				p.logConditional(LogConnections, "completed ACME TLS-ALPN-01 challenge from %s; not forwarding to backend", conn.RemoteAddr())
+				reason = CloseRefused
 				return
 			}
 
-			backend, err := p.Dial(ctx)
+			backend, err := p.dialBackend(ctx)
+			if observer != nil {
+				// Dialed may refuse the connection here, before the backend
+				// is registered, before the PROXY header and before fuse:
+				// no byte has been forwarded in either direction when it
+				// returns. On a failed dial the dial error decides below.
+				if derr := observer.Dialed(backend, err); derr != nil && err == nil {
+					if backend != nil {
+						backend.Close()
+					}
+					p.metrics.ErrorCounter.Inc(1)
+					p.logConditional(LogConnectionErrors, "connection from %s refused before forwarding: %s", conn.RemoteAddr(), derr)
+					reason = CloseRefused
+					if p.context.Err() != nil {
+						reason = CloseShutdown
+					}
+					return
+				}
+			}
 			if err != nil {
 				p.metrics.ErrorCounter.Inc(1)
 				p.logConditional(LogConnectionErrors, "error on dial: %s", err)
+				reason = CloseError
+				if p.context.Err() != nil {
+					reason = CloseShutdown
+				}
 				return
 			}
+			live.setBackend(backend)
 
 			if p.proxyProtocol != ProxyProtocolOff {
 				var tlsState *tls.ConnectionState
@@ -505,18 +827,20 @@ func (p *Proxy) Accept() {
 					p.metrics.ErrorCounter.Inc(1)
 					p.logConditional(LogConnectionErrors, "error building proxy header: %s", err)
 					backend.Close()
+					reason = CloseError
 					return
 				}
 				if _, err = h.WriteTo(backend); err != nil {
 					p.metrics.ErrorCounter.Inc(1)
 					p.logConditional(LogConnectionErrors, "error writing proxy header: %s", err)
 					backend.Close()
+					reason = CloseError
 					return
 				}
 			}
 
 			p.metrics.SuccessCounter.Inc(1)
-			p.fuse(conn, backend)
+			reason = p.fuse(conn, backend)
 		}()
 	}
 }
@@ -557,8 +881,11 @@ func forceHandshake(ctx context.Context, conn net.Conn, m *Metrics) error {
 	return nil
 }
 
-// Fuse connections together
-func (p *Proxy) fuse(client, backend net.Conn) {
+// Fuse connections together. Returns why the connection ended: the lifetime
+// cap, an error, or one side finishing (a close-timeout after a half-close
+// counts as the latter; before any side finishes the only deadline set is
+// the lifetime cap).
+func (p *Proxy) fuse(client, backend net.Conn) CloseReason {
 	// Copy from client -> backend, and from backend -> client
 	start := time.Now()
 	p.logConnectionMessage("opening", client, backend, -1, -1, time.Time{})
@@ -578,18 +905,38 @@ func (p *Proxy) fuse(client, backend net.Conn) {
 		_ = backend.Close()
 	}()
 
-	returnedC := make(chan int64)
+	type copied struct {
+		n   int64
+		err error
+	}
+	returnedC := make(chan copied)
 	go func() {
-		returnedC <- p.copyData(client, backend)
+		n, err := p.copyData(client, backend)
+		returnedC <- copied{n, err}
 	}()
-	forwarded := p.copyData(backend, client)
+	forwarded, forwardErr := p.copyData(backend, client)
 	returned := <-returnedC
 
-	p.logConnectionMessage("closed", client, backend, forwarded, returned, start)
+	p.logConnectionMessage("closed", client, backend, forwarded, returned.n, start)
+
+	reason := CloseEOF
+	for _, err := range []error{forwardErr, returned.err} {
+		switch {
+		case err == nil:
+		case isTimeoutError(err):
+			if p.MaxConnLifetime > 0 && time.Since(start) >= p.MaxConnLifetime {
+				return CloseLifetime
+			}
+		default:
+			reason = CloseError
+		}
+	}
+	return reason
 }
 
-// Copy data between two connections
-func (p *Proxy) copyData(dst net.Conn, src net.Conn) (written int64) {
+// Copy data between two connections. The returned error is the copy error,
+// if any, other than the peer closing; those are the normal end of a copy.
+func (p *Proxy) copyData(dst net.Conn, src net.Conn) (written int64, err error) {
 	// When we're done copying the data, we close the read/write sides of the
 	// src/dst respectively. This uses the shutdown system call to send a FIN
 	// packet to the other end of the connection. By only closing the read/write
@@ -613,7 +960,22 @@ func (p *Proxy) copyData(dst net.Conn, src net.Conn) (written int64) {
 	}()
 
 	// Get a buffer for copy from the pool of shared buffers, to reduce allocs.
+	// A pooled buffer of another size (the size was changed after some were
+	// pooled) is dropped for a fresh one of the configured size.
+	//
+	// Reusing a buffer another connection filled is equivalent to a fresh
+	// one because the buffer is scratch that io.CopyBuffer writes into before
+	// it reads from: each round reads n bytes from src into buf[:n] and
+	// writes exactly buf[:n] to dst, so what reaches dst is only what src
+	// gave in this call; the stale bytes beyond n are never forwarded. The
+	// buffer is held by this direction alone from Get to Put, so no two
+	// copies share one. TestCopyDataPooledBufferIsScratch and
+	// TestCopyDataSequentialConnectionsForwardOwnBytes hold it to that.
 	buf := p.pool.Get().(*[]byte)
+	if want := p.copyBufferSize(); len(*buf) != want {
+		b := make([]byte, want)
+		buf = &b
+	}
 	defer p.pool.Put(buf)
 
 	// Note: We wrap src and dst in io.Writer and io.Reader structs respectively,
@@ -636,12 +998,15 @@ func (p *Proxy) copyData(dst net.Conn, src net.Conn) (written int64) {
 	//
 	// See: https://github.com/golang/go/issues/16474
 	// See: https://github.com/golang/go/issues/67074
-	written, err := io.CopyBuffer(
+	written, err = io.CopyBuffer(
 		struct{ io.Writer }{dst},
 		struct{ io.Reader }{src},
 		*buf)
 
-	if err != nil && !isClosedConnectionError(err) {
+	if err != nil && isClosedConnectionError(err) {
+		err = nil
+	}
+	if err != nil {
 		// We don't log individual "read from closed connection" errors, because
 		// we already have a log statement showing that a pipe has been closed.
 		if isTimeoutError(err) {
@@ -650,7 +1015,7 @@ func (p *Proxy) copyData(dst net.Conn, src net.Conn) (written int64) {
 		p.logConditional(LogConnectionErrors, "error during copy: %s", err)
 	}
 
-	return written
+	return written, err
 }
 
 // Log information message about connection

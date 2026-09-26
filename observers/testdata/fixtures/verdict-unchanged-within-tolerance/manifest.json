@@ -1,0 +1,73 @@
+{
+    "fixture": "verdict-unchanged-within-tolerance",
+    "description": "admin has not written for one reader cycle (its 43 is current; the reader's 44 recorded it, the reader's 43 recorded 42). k = 1 < STALE_AFTER = 2, so alive.",
+    "rules": [
+        "SPEC 8.1 V6"
+    ],
+    "reader": "tunnel",
+    "reader_booted": false,
+    "parameters": {
+        "window": 4,
+        "stale_slack_cycles": 1,
+        "staging_stale_after_seconds": 60,
+        "max_heartbeat_bytes": 8192,
+        "max_fault_bytes": 8192,
+        "max_halt_bytes": 8192,
+        "now": "2026-09-20T10:07:25Z"
+    },
+    "directories": [
+        "stores/admin",
+        "stores/admin/copy",
+        "stores/admin/copy-super",
+        "stores/admin/copy-super/heartbeat",
+        "stores/admin/copy/heartbeat",
+        "stores/admin/halts",
+        "stores/admin/heartbeat",
+        "stores/material",
+        "stores/material/copy",
+        "stores/material/copy-super",
+        "stores/material/copy-super/heartbeat",
+        "stores/material/copy/heartbeat",
+        "stores/material/halts",
+        "stores/material/heartbeat",
+        "stores/super",
+        "stores/super/copy-admin",
+        "stores/super/copy-admin/heartbeat",
+        "stores/super/copy-material",
+        "stores/super/copy-material/heartbeat",
+        "stores/super/copy-tunnel",
+        "stores/super/copy-tunnel/heartbeat",
+        "stores/super/halts",
+        "stores/super/heartbeat",
+        "stores/tunnel",
+        "stores/tunnel/copy",
+        "stores/tunnel/copy-super",
+        "stores/tunnel/copy-super/heartbeat",
+        "stores/tunnel/copy/heartbeat",
+        "stores/tunnel/halts",
+        "stores/tunnel/heartbeat"
+    ],
+    "expect": {
+        "verdicts": {
+            "admin": "alive",
+            "material": "alive",
+            "super": "alive"
+        },
+        "failing": [],
+        "halt_in_force_before": false,
+        "halt": {
+            "writes": false
+        },
+        "publish": {
+            "sequence": 45,
+            "previous": "b26339a226b95c8232bb32a6e849df9c5e437d98e3e7a7506b9aa4bde09c7a06",
+            "observed": {
+                "admin": "94d5e2caa042f5e42911c3d71f802eb47e7754e4b8650da9e8e492fd85aa40a4",
+                "material": "bd1f1ce4ee7653651261df27a1660fa87a11b44e31b3137f08534184648bbaee",
+                "super": "5f016501a1cec3fe403f50637c44d9951ad85bd92c9d7f7dd3076404359e9037"
+            },
+            "boot": null,
+            "stop": false
+        }
+    }
+}

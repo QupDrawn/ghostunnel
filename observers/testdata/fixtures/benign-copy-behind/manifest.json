@@ -1,0 +1,81 @@
+{
+    "fixture": "benign-copy-behind",
+    "description": "tunnel/copy/heartbeat/ holds material's 38..41 while material's own folder holds 41..44. Entry 41 is in the window and matches; 38..40 are behind. The copy is not being maintained: copy-current, a fault. Nothing in it was unpublished, so no compromise.",
+    "rules": [
+        "SPEC 9 K5",
+        "SPEC 9 K6"
+    ],
+    "reader": "tunnel",
+    "reader_booted": false,
+    "parameters": {
+        "window": 4,
+        "stale_slack_cycles": 1,
+        "staging_stale_after_seconds": 60,
+        "max_heartbeat_bytes": 8192,
+        "max_fault_bytes": 8192,
+        "max_halt_bytes": 8192,
+        "now": "2026-09-20T10:07:25Z"
+    },
+    "directories": [
+        "stores/admin",
+        "stores/admin/copy",
+        "stores/admin/copy-super",
+        "stores/admin/copy-super/heartbeat",
+        "stores/admin/copy/heartbeat",
+        "stores/admin/halts",
+        "stores/admin/heartbeat",
+        "stores/material",
+        "stores/material/copy",
+        "stores/material/copy-super",
+        "stores/material/copy-super/heartbeat",
+        "stores/material/copy/heartbeat",
+        "stores/material/halts",
+        "stores/material/heartbeat",
+        "stores/super",
+        "stores/super/copy-admin",
+        "stores/super/copy-admin/heartbeat",
+        "stores/super/copy-material",
+        "stores/super/copy-material/heartbeat",
+        "stores/super/copy-tunnel",
+        "stores/super/copy-tunnel/heartbeat",
+        "stores/super/halts",
+        "stores/super/heartbeat",
+        "stores/tunnel",
+        "stores/tunnel/copy",
+        "stores/tunnel/copy-super",
+        "stores/tunnel/copy-super/heartbeat",
+        "stores/tunnel/copy/heartbeat",
+        "stores/tunnel/halts",
+        "stores/tunnel/heartbeat"
+    ],
+    "expect": {
+        "verdicts": {
+            "admin": "alive",
+            "material": "alive",
+            "super": "alive"
+        },
+        "failing": [
+            {
+                "check": "copy-current",
+                "subject": "material"
+            }
+        ],
+        "halt_in_force_before": false,
+        "halt": {
+            "writes": true,
+            "reason": "copy-current",
+            "subject": "material"
+        },
+        "publish": {
+            "sequence": 45,
+            "previous": "1e483e6df43e9524b9551036c22c756059195af42e82f59ec50323c329710027",
+            "observed": {
+                "admin": "4bf0a966b311786d993b76eb1c2dff4aa17205aeead688498ad7388082f03a14",
+                "material": "49f30f4bdc8fd4d378955349483d5fc409b44981b801a24c32cf2bd00cfc7559",
+                "super": "c60055cc11c31852157f32716e8b1700326d66016c2618f19d90a4427cb52fc4"
+            },
+            "boot": null,
+            "stop": false
+        }
+    }
+}

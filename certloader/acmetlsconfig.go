@@ -236,10 +236,33 @@ func (a *acmeTLSConfigSource) GetServerConfig(base *tls.Config) (TLSServerConfig
 	}, nil
 }
 
+// GetServerConfigVerifying implements ClientVerifyingSource: the configs
+// returned verify the client's chain through verifier, bound per trust
+// store (see GetServerConfigVerifying and bindClientVerifier).
+func (a *acmeTLSConfigSource) GetServerConfigVerifying(base *tls.Config, verifier ClientVerifier) (TLSServerConfig, error) {
+	if !a.CanServe() {
+		return nil, ErrACMECertUnavailable
+	}
+	if base == nil {
+		base = new(tls.Config)
+	}
+	return &acmeTLSConfig{
+		magicConfig: a.magicConfig,
+		base:        verifyingBase(base, verifier),
+		source:      a,
+		verifier:    verifier,
+	}, nil
+}
+
 type acmeTLSConfig struct {
 	magicConfig *certmagic.Config
 	base        *tls.Config
 	source      *acmeTLSConfigSource
+
+	// verifier, when set, verifies the client's chain in place of
+	// crypto/tls; the built server config binds it to the trust store it
+	// is built for.
+	verifier ClientVerifier
 
 	// Cached config, keyed on the trust-store pointer.
 	cachedServer atomic.Pointer[cachedTLSConfig]
@@ -270,7 +293,11 @@ func (a *acmeTLSConfig) buildServerConfig(pool *x509.CertPool) *tls.Config {
 	if a.base.ClientAuth != tls.RequireAnyClientCert {
 		config.ClientCAs = pool
 	}
+	if a.verifier != nil {
+		bindClientVerifier(config, pool, a.verifier)
+	}
 	config.NextProtos = append(append([]string(nil), a.base.NextProtos...), acmez.ACMETLS1Protocol)
+	reverifyResumedSessions(config)
 
 	// The ACME CA's TLS-ALPN-01 validator opens a probe handshake with
 	// SupportedProtos=["acme-tls/1"] (per RFC 8737) and no client certificate.

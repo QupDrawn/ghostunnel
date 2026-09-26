@@ -1,0 +1,112 @@
+# ghostunnel.service: the proxy, as user gt. It writes traces into gt/ and
+# reads the four observer stores through its gate on every accept. It has
+# write access to nothing else in the tree: the store tree is read-only in its
+# namespace (ProtectSystem=strict, ReadOnlyPaths=) except gt/, and gt/ is the
+# only directory the user gt owns (deploy/tree.tsv).
+#
+# Operator values come from /etc/ghostunnel/ring.env (deploy/ring.env.example):
+# GT_LISTEN, GT_TARGET, GT_CERT, GT_KEY, GT_CACERT, GT_STATUS, GT_ACL. The file
+# is required (no leading "-"): a missing file fails the start rather than
+# starting with nothing. ExecStartPre refuses an empty variable, because an
+# empty ${VAR} would silently move the next flag into its place. This unit
+# reads that file alone; what the tunnel observer expects of the proxy is a
+# separate file this unit never reads (README, "Two files, two sources").
+[Unit]
+Description=ghostunnel mTLS proxy (observer ring member gt)
+Documentation=file:///usr/share/doc/ghostunnel-ring/README.md
+PartOf=ghostunnel-ring.target
+# Ordering only, for a readable journal; not a dependency. ghostunnel refuses
+# to serve until the ring is fresh whatever the start order.
+After=network-online.target ghostunnel-obs-tunnel.service ghostunnel-obs-admin.service ghostunnel-obs-material.service ghostunnel-obs-super.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=gt
+Group=gt
+# gt is also in gtring-pem (setup-tree.sh) to read cert, CA and policy; the
+# key is root:gt 0640. systemd applies the user's groups from /etc/group.
+# gt is NOT in gtring-trace, the group that reads gt/: it owns gt/ and
+# reads it as the owner.
+# UMask=0027, not 0022: the trace names every peer that presented a
+# certificate, so gt/ is gt:gtring-trace 0750 (tree.tsv) and the emitter
+# requests 0750 on every directory and 0640 on every file it creates there
+# (ringtrace.DirMode, FileMode). 0027 lets exactly those land and would
+# narrow anything wider; check-units.sh --static requires this exact line.
+# The proxy creates nothing else on disk: --listen and --status are TCP in
+# ring.env (ring.env.example says what this umask would do to a unix: one).
+UMask=0027
+EnvironmentFile=/etc/ghostunnel/ring.env
+# systemd substitutes ${VAR} itself (no shell): an unset or empty variable
+# becomes the empty argument and test -n fails the start.
+ExecStartPre=/usr/bin/test -n "${GT_LISTEN}"
+ExecStartPre=/usr/bin/test -n "${GT_TARGET}"
+ExecStartPre=/usr/bin/test -n "${GT_CERT}"
+ExecStartPre=/usr/bin/test -n "${GT_KEY}"
+ExecStartPre=/usr/bin/test -n "${GT_CACERT}"
+ExecStartPre=/usr/bin/test -n "${GT_STATUS}"
+ExecStartPre=/usr/bin/test -n "${GT_ACL}"
+# --ring-traces and --ring-stores are the baked defaults, written out so the
+# unit states the paths it is granted. --ring-heartbeat-max-age has no default
+# and must exceed super's -cadence (10 s); 30 s is the contract in the README.
+# --ring-tick (the tick line the members judge trace-fresh by) is left at its
+# default, 5 s, well below the members' -cadence; check-units.sh refuses a
+# value of 10 s or more.
+# --status must be loopback (the admin member's status-listener-bound);
+# GT_STATUS carries it.
+# $GT_ACL is word-split on purpose: it holds one or more --allow-* flags.
+ExecStart=/usr/local/bin/ghostunnel server \
+    --listen ${GT_LISTEN} \
+    --target ${GT_TARGET} \
+    --cert ${GT_CERT} \
+    --key ${GT_KEY} \
+    --cacert ${GT_CACERT} \
+    --status ${GT_STATUS} \
+    $GT_ACL \
+    --ring-traces /var/lib/ghostunnel-ring/stores/gt \
+    --ring-stores /var/lib/ghostunnel-ring/stores \
+    --ring-heartbeat-max-age 30s
+Restart=on-failure
+RestartSec=2s
+# Watchdog. The proxy's health notify sends WATCHDOG=1 every 7.5 s (half the
+# interval) and only when it is true: the accept loop has run within 5 s (it
+# iterates every 1 s when idle, so a healthy loop is never that far behind),
+# the trace emitter and the ring are not stuck, the listener is open. Two
+# missed notifies (15 s) are a wedged proxy: systemd aborts it and Restart=
+# brings it back (README, "Health and the watchdog"). 15 s is the smallest
+# interval those numbers allow. WatchdogSec= implies NotifyAccess=main;
+# /run, where the notify socket lives, is in the landlock allow-list.
+WatchdogSec=15
+# On stop ghostunnel closes the listener and drains in-flight connections for
+# up to --shutdown-timeout (default 5m); give systemd at least that.
+TimeoutStopSec=330s
+
+# ---- sandbox ----------------------------------------------------------------
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+# Its own view of /proc only. This does not hide ghostunnel from the admin
+# observer: ProtectProc= changes the /proc this unit sees, not what other
+# users see of it.
+ProtectProc=invisible
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+# The proxy needs sockets; no PrivateNetwork=. For a listener below 1024 add
+# AmbientCapabilities=CAP_NET_BIND_SERVICE and CapabilityBoundingSet=CAP_NET_BIND_SERVICE.
+CapabilityBoundingSet=
+# The whole store tree read-only (already so under ProtectSystem=strict; stated
+# so the grant below is read as the exception it is) ...
+ReadOnlyPaths=/var/lib/ghostunnel-ring/stores
+# ... except the trace root: ghostunnel creates <boot>/ and appends
+# <seq>.trace there (ringtrace/README.md section 1.3). Write matrix row gt.
+ReadWritePaths=/var/lib/ghostunnel-ring/stores/gt
+
+[Install]
+WantedBy=ghostunnel-ring.target

@@ -1,0 +1,22 @@
+# ghostunnel-ring.target: the five processes of the observer ring as one unit
+# of start and stop. Wants= (not Requires=): a member that fails is restarted
+# by its own Restart=, and its absence is what the other members and the gate
+# detect; the target does not decide that for them.
+#
+# Order is not enforced. The observers may start in any order: each raises a
+# halt for the members it cannot yet see and clears it once it can (README,
+# "Cold start"). ghostunnel refuses every connection until
+# super's heartbeat is fresh and no halt is in force, so it may start before
+# or after the observers. ghostunnel.service carries an After= on the four
+# observers only so that the journal reads in a sensible order.
+[Unit]
+Description=ghostunnel observer ring (tunnel, admin, material, super and ghostunnel)
+Documentation=file:///usr/share/doc/ghostunnel-ring/README.md
+Wants=ghostunnel-obs-tunnel.service
+Wants=ghostunnel-obs-admin.service
+Wants=ghostunnel-obs-material.service
+Wants=ghostunnel-obs-super.service
+Wants=ghostunnel.service
+
+[Install]
+WantedBy=multi-user.target

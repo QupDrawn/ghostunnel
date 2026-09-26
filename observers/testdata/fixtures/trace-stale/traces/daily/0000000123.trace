@@ -1,0 +1,11 @@
+{"kind":"trace","version":1,"schedule":"daily","run":123,"started":"2026-09-18T10:00:00Z"}
+{"kind":"task","id":"prune-metrics","completed":true,"count":0}
+{"kind":"task","id":"reset-daily-counters","completed":true,"count":0}
+{"kind":"task","id":"reset-counters","completed":true,"count":0}
+{"kind":"task","id":"expire-leases","completed":true,"count":0}
+{"kind":"task","id":"expire-tokens","completed":true,"count":0}
+{"kind":"task","id":"expire-transfers","completed":true,"count":0}
+{"kind":"task","id":"expire-pending-changes","completed":true,"count":0}
+{"kind":"task","id":"truncate-daily-log","completed":true,"count":0}
+{"kind":"task","id":"rollover:new-day","completed":true,"count":0}
+{"kind":"finish","finished":"2026-09-18T10:00:07Z"}

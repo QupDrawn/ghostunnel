@@ -24,9 +24,12 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"fmt"
 	"io"
 	"math/big"
 	"net"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -256,4 +259,155 @@ func benchmarkConnectionChurn(b *testing.B, connMetrics *Metrics) {
 			_ = conn.Close()
 		}
 	})
+}
+
+// BenchmarkWarmPoolChurn drives connection churn with plain TCP on both legs
+// (no handshake, so the backend dial is a visible share of each connection)
+// against an in-process echo backend, with the warm backend pool off
+// (warm=0, the default) and on (warm=8, and warm=32 to tell a pool too
+// small for the churn from the pool's own cost), serially and 16-way. Each
+// iteration opens a connection through the proxy, sends one byte, reads the
+// echo and drains to the backend's close. BenchmarkBackendDial is the cost
+// of the dial alone, for the dial's share of a connection. Run with:
+//
+//	go test -run '^$' -bench 'BenchmarkWarmPoolChurn|BenchmarkBackendDial' -count=3 ./proxy/
+func BenchmarkWarmPoolChurn(b *testing.B) {
+	backend := churnEchoBackend(b)
+	for _, warm := range []int{0, 8, 32} {
+		for _, par := range []int{1, 16} {
+			b.Run(fmt.Sprintf("warm=%d/par=%d", warm, par), func(b *testing.B) {
+				incoming, err := net.Listen("tcp", "127.0.0.1:0")
+				if err != nil {
+					b.Fatal(err)
+				}
+				dialer := func(ctx context.Context) (net.Conn, error) {
+					var d net.Dialer
+					return d.DialContext(ctx, "tcp", backend.Addr().String())
+				}
+				p := New(incoming, 5*time.Second, 5*time.Second, 0, 0, dialer, &testLogger{}, 0, ProxyProtocolOff, NilMetrics())
+				p.WarmBackendConnections = warm
+				go p.Accept()
+				defer func() {
+					p.Shutdown()
+					p.Wait()
+				}()
+				if warm > 0 {
+					// Let the pool fill before the clock starts.
+					time.Sleep(100 * time.Millisecond)
+				}
+				addr := incoming.Addr().String()
+				b.ReportAllocs()
+				b.ResetTimer()
+				var wg sync.WaitGroup
+				var failed atomic.Bool
+				per := b.N / par
+				for i := 0; i < par; i++ {
+					n := per
+					if i == 0 {
+						n += b.N - per*par
+					}
+					wg.Add(1)
+					go func() {
+						defer wg.Done()
+						buf := make([]byte, 64)
+						for j := 0; j < n; j++ {
+							if err := churnOnce(addr, buf); err != nil {
+								failed.Store(true)
+								return
+							}
+						}
+					}()
+				}
+				wg.Wait()
+				if failed.Load() {
+					b.Fatal("a connection through the proxy failed")
+				}
+			})
+		}
+	}
+}
+
+// BenchmarkBackendDial is one plain TCP dial to the echo backend and the
+// close, serially and 16-way: the dial's cost on its own.
+func BenchmarkBackendDial(b *testing.B) {
+	backend := churnEchoBackend(b)
+	for _, par := range []int{1, 16} {
+		b.Run(fmt.Sprintf("par=%d", par), func(b *testing.B) {
+			addr := backend.Addr().String()
+			b.ResetTimer()
+			var wg sync.WaitGroup
+			per := b.N / par
+			for i := 0; i < par; i++ {
+				n := per
+				if i == 0 {
+					n += b.N - per*par
+				}
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					buf := make([]byte, 64)
+					for j := 0; j < n; j++ {
+						_ = churnOnce(addr, buf)
+					}
+				}()
+			}
+			wg.Wait()
+		})
+	}
+}
+
+// churnEchoBackend is the one-request echo backend of the churn benchmarks:
+// it reads one request, echoes it and closes, so it is the active closer
+// (see benchmarkConnectionChurn).
+func churnEchoBackend(b *testing.B) net.Listener {
+	b.Helper()
+	backend, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { backend.Close() })
+	go func() {
+		for {
+			conn, err := backend.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				buf := make([]byte, 64)
+				if n, err := c.Read(buf); err == nil && n > 0 {
+					_, _ = c.Write(buf[:n])
+				}
+				_ = c.Close()
+			}(conn)
+		}
+	}()
+	return backend
+}
+
+// churnOnce is one plain TCP connection to addr: send one byte, read the
+// echo, drain to the far side's close.
+func churnOnce(addr string, buf []byte) error {
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	if _, err := conn.Write([]byte("A")); err != nil {
+		return err
+	}
+	got := 0
+	for {
+		n, err := conn.Read(buf)
+		got += n
+		if err != nil {
+			if err != io.EOF {
+				return err
+			}
+			break
+		}
+	}
+	if got == 0 {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
 }

@@ -1,0 +1,57 @@
+# The store tree, one line per directory: path, owner, group, mode.
+# Tab-separated. setup-tree.sh creates exactly this; check-units.sh walks it.
+# No file is pre-created: every file in the tree is written by its one writer
+# at run time (heartbeat/*.hb, fault, halt, halts/<writer>, gt/<boot>/*.trace,
+# gt/chains/*.der, gt/material/*).
+#
+# Modes: 0755 is a directory with one writer, its owner. 1775 is a directory
+# whose entries have different owners: root owns it, the group may create in
+# it, the sticky bit lets an entry be renamed over, unlinked or replaced only
+# by the entry's owner (or root). See README "The halts/ slot problem".
+# 2750 is the trace root alone, gt:gtring-trace with the setgid bit: the trace names every peer
+# that presented a certificate, so the four observers read it through the
+# group and no other account reads a byte. See README "The trace root is
+# group-readable". The setgid bit makes what ghostunnel creates inside inherit the group; it requests 0750 directories and 0640
+# files (UMask=0027 on its unit).
+/var/lib/ghostunnel-ring	root	root	0755
+/var/lib/ghostunnel-ring/stores	root	root	0755
+# tunnel's store. Root is root:gtobs-tunnel 1775: tunnel creates fault, halt and
+# their .tmp here through the group bit and heartbeat/ is its own; sticky stops
+# it renaming or removing copy/, copy-super/ and halts/, which it does not own.
+/var/lib/ghostunnel-ring/stores/tunnel	root	gtobs-tunnel	1775
+/var/lib/ghostunnel-ring/stores/tunnel/heartbeat	gtobs-tunnel	gtobs-tunnel	0755
+/var/lib/ghostunnel-ring/stores/tunnel/copy	gtobs-material	gtobs-material	0755
+/var/lib/ghostunnel-ring/stores/tunnel/copy/heartbeat	gtobs-material	gtobs-material	0755
+/var/lib/ghostunnel-ring/stores/tunnel/copy-super	gtobs-super	gtobs-super	0755
+/var/lib/ghostunnel-ring/stores/tunnel/copy-super/heartbeat	gtobs-super	gtobs-super	0755
+/var/lib/ghostunnel-ring/stores/tunnel/halts	root	gtring-halts-tunnel	1775
+# admin's store
+/var/lib/ghostunnel-ring/stores/admin	root	gtobs-admin	1775
+/var/lib/ghostunnel-ring/stores/admin/heartbeat	gtobs-admin	gtobs-admin	0755
+/var/lib/ghostunnel-ring/stores/admin/copy	gtobs-tunnel	gtobs-tunnel	0755
+/var/lib/ghostunnel-ring/stores/admin/copy/heartbeat	gtobs-tunnel	gtobs-tunnel	0755
+/var/lib/ghostunnel-ring/stores/admin/copy-super	gtobs-super	gtobs-super	0755
+/var/lib/ghostunnel-ring/stores/admin/copy-super/heartbeat	gtobs-super	gtobs-super	0755
+/var/lib/ghostunnel-ring/stores/admin/halts	root	gtring-halts-admin	1775
+# material's store
+/var/lib/ghostunnel-ring/stores/material	root	gtobs-material	1775
+/var/lib/ghostunnel-ring/stores/material/heartbeat	gtobs-material	gtobs-material	0755
+/var/lib/ghostunnel-ring/stores/material/copy	gtobs-admin	gtobs-admin	0755
+/var/lib/ghostunnel-ring/stores/material/copy/heartbeat	gtobs-admin	gtobs-admin	0755
+/var/lib/ghostunnel-ring/stores/material/copy-super	gtobs-super	gtobs-super	0755
+/var/lib/ghostunnel-ring/stores/material/copy-super/heartbeat	gtobs-super	gtobs-super	0755
+/var/lib/ghostunnel-ring/stores/material/halts	root	gtring-halts-material	1775
+# super's store
+/var/lib/ghostunnel-ring/stores/super	root	gtobs-super	1775
+/var/lib/ghostunnel-ring/stores/super/heartbeat	gtobs-super	gtobs-super	0755
+/var/lib/ghostunnel-ring/stores/super/halts	root	gtring-halts-super	1775
+/var/lib/ghostunnel-ring/stores/super/copy-tunnel	gtobs-tunnel	gtobs-tunnel	0755
+/var/lib/ghostunnel-ring/stores/super/copy-tunnel/heartbeat	gtobs-tunnel	gtobs-tunnel	0755
+/var/lib/ghostunnel-ring/stores/super/copy-admin	gtobs-admin	gtobs-admin	0755
+/var/lib/ghostunnel-ring/stores/super/copy-admin/heartbeat	gtobs-admin	gtobs-admin	0755
+/var/lib/ghostunnel-ring/stores/super/copy-material	gtobs-material	gtobs-material	0755
+/var/lib/ghostunnel-ring/stores/super/copy-material/heartbeat	gtobs-material	gtobs-material	0755
+# ghostunnel's traces. ghostunnel creates lock, chains/<sha256>.der, <boot>/ and <boot>/<seq>.trace
+# inside; never deletes. gt:gtring-trace 2750: gt writes as the owner, the four observers read
+# through the group, nobody else lists it or reaches a file in it by name.
+/var/lib/ghostunnel-ring/stores/gt	gt	gtring-trace	2750

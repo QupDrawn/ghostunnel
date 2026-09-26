@@ -1,0 +1,65 @@
+# The write matrix: writer, path, grant, how. Tab-separated.
+#
+# grant rw: a directory the writer creates, renames and unlinks files in. It is
+#           exactly the writer's unit's ReadWritePaths= set, and the DAC in
+#           tree.tsv gives the same writer the same directory (and nobody else,
+#           except the shared halts/ where the sticky bit and file ownership
+#           narrow it to one slot).
+# grant ro: a directory inside one of the writer's rw directories that another
+#           writer owns; the unit remasks it read-only (ReadOnlyPaths=) so the
+#           namespace grant is exact, not just the DAC. It is exactly the
+#           unit's ReadOnlyPaths= set minus the tree root.
+#
+# The heartbeat/ under a rw directory is inside that grant and is not listed.
+# check-units.sh --static asserts every unit against this file.
+
+# gtobs-tunnel: own store; author of admin/copy; copy-tunnel in super; slot tunnel in the other three halts/
+gtobs-tunnel	/var/lib/ghostunnel-ring/stores/tunnel	rw	own store: heartbeat/<seq>.hb(.tmp), fault(.tmp), halt(.tmp); DAC group bit on a root-owned sticky root
+gtobs-tunnel	/var/lib/ghostunnel-ring/stores/admin/copy	rw	tunnel is admin's copy author (copy-authors admin=tunnel); DAC owner
+gtobs-tunnel	/var/lib/ghostunnel-ring/stores/super/copy-tunnel	rw	tunnel's copy in the coordinator's store; DAC owner
+gtobs-tunnel	/var/lib/ghostunnel-ring/stores/admin/halts	rw	slot halts/tunnel only; DAC group gtring-halts-admin + sticky
+gtobs-tunnel	/var/lib/ghostunnel-ring/stores/material/halts	rw	slot halts/tunnel only; DAC group gtring-halts-material + sticky
+gtobs-tunnel	/var/lib/ghostunnel-ring/stores/super/halts	rw	slot halts/tunnel only; DAC group gtring-halts-super + sticky
+gtobs-tunnel	/var/lib/ghostunnel-ring/stores/tunnel/copy	ro	material's copy inside tunnel's store; owned gtobs-material
+gtobs-tunnel	/var/lib/ghostunnel-ring/stores/tunnel/copy-super	ro	super's copy inside tunnel's store; owned gtobs-super
+gtobs-tunnel	/var/lib/ghostunnel-ring/stores/tunnel/halts	ro	halts delivered to tunnel; written by the other three, never by tunnel
+
+# gtobs-admin: own store; author of material/copy; copy-admin in super; slot admin in the other three halts/
+gtobs-admin	/var/lib/ghostunnel-ring/stores/admin	rw	own store; DAC group bit on a root-owned sticky root
+gtobs-admin	/var/lib/ghostunnel-ring/stores/material/copy	rw	admin is material's copy author (copy-authors material=admin); DAC owner
+gtobs-admin	/var/lib/ghostunnel-ring/stores/super/copy-admin	rw	admin's copy in the coordinator's store; DAC owner
+gtobs-admin	/var/lib/ghostunnel-ring/stores/tunnel/halts	rw	slot halts/admin only; DAC group gtring-halts-tunnel + sticky
+gtobs-admin	/var/lib/ghostunnel-ring/stores/material/halts	rw	slot halts/admin only; DAC group gtring-halts-material + sticky
+gtobs-admin	/var/lib/ghostunnel-ring/stores/super/halts	rw	slot halts/admin only; DAC group gtring-halts-super + sticky
+gtobs-admin	/var/lib/ghostunnel-ring/stores/admin/copy	ro	tunnel's copy inside admin's store; owned gtobs-tunnel
+gtobs-admin	/var/lib/ghostunnel-ring/stores/admin/copy-super	ro	super's copy inside admin's store; owned gtobs-super
+gtobs-admin	/var/lib/ghostunnel-ring/stores/admin/halts	ro	halts delivered to admin; written by the other three, never by admin
+
+# gtobs-material: own store; author of tunnel/copy; copy-material in super; slot material in the other three halts/
+gtobs-material	/var/lib/ghostunnel-ring/stores/material	rw	own store; DAC group bit on a root-owned sticky root
+gtobs-material	/var/lib/ghostunnel-ring/stores/tunnel/copy	rw	material is tunnel's copy author (copy-authors tunnel=material); DAC owner
+gtobs-material	/var/lib/ghostunnel-ring/stores/super/copy-material	rw	material's copy in the coordinator's store; DAC owner
+gtobs-material	/var/lib/ghostunnel-ring/stores/tunnel/halts	rw	slot halts/material only; DAC group gtring-halts-tunnel + sticky
+gtobs-material	/var/lib/ghostunnel-ring/stores/admin/halts	rw	slot halts/material only; DAC group gtring-halts-admin + sticky
+gtobs-material	/var/lib/ghostunnel-ring/stores/super/halts	rw	slot halts/material only; DAC group gtring-halts-super + sticky
+gtobs-material	/var/lib/ghostunnel-ring/stores/material/copy	ro	admin's copy inside material's store; owned gtobs-admin
+gtobs-material	/var/lib/ghostunnel-ring/stores/material/copy-super	ro	super's copy inside material's store; owned gtobs-super
+gtobs-material	/var/lib/ghostunnel-ring/stores/material/halts	ro	halts delivered to material; written by the other three, never by material
+
+# gtobs-super: own store; copy-super in all three others; slot super in the other three halts/. Writes no copy/.
+gtobs-super	/var/lib/ghostunnel-ring/stores/super	rw	own store; DAC group bit on a root-owned sticky root
+gtobs-super	/var/lib/ghostunnel-ring/stores/tunnel/copy-super	rw	super's copy in tunnel's store; DAC owner
+gtobs-super	/var/lib/ghostunnel-ring/stores/admin/copy-super	rw	super's copy in admin's store; DAC owner
+gtobs-super	/var/lib/ghostunnel-ring/stores/material/copy-super	rw	super's copy in material's store; DAC owner
+gtobs-super	/var/lib/ghostunnel-ring/stores/tunnel/halts	rw	slot halts/super only; DAC group gtring-halts-tunnel + sticky
+gtobs-super	/var/lib/ghostunnel-ring/stores/admin/halts	rw	slot halts/super only; DAC group gtring-halts-admin + sticky
+gtobs-super	/var/lib/ghostunnel-ring/stores/material/halts	rw	slot halts/super only; DAC group gtring-halts-material + sticky
+gtobs-super	/var/lib/ghostunnel-ring/stores/super/halts	ro	halts delivered to super; written by the other three, never by super
+gtobs-super	/var/lib/ghostunnel-ring/stores/super/copy-tunnel	ro	tunnel's copy inside super's store; owned gtobs-tunnel
+gtobs-super	/var/lib/ghostunnel-ring/stores/super/copy-admin	ro	admin's copy inside super's store; owned gtobs-admin
+gtobs-super	/var/lib/ghostunnel-ring/stores/super/copy-material	ro	material's copy inside super's store; owned gtobs-material
+
+# gt (ghostunnel): traces only. Reads the four stores through the gate; writes none of them.
+# The trace root is the one directory not readable by everyone: gt:gtring-trace 0750, and the
+# four observers read it through the group (SupplementaryGroups=gtring-trace on their units).
+gt	/var/lib/ghostunnel-ring/stores/gt	rw	trace root: creates <boot>/ and appends <seq>.trace; DAC owner, group gtring-trace reads

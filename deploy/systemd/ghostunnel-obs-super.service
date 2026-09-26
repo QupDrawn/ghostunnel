@@ -1,0 +1,92 @@
+# ghostunnel-obs-super.service: the coordinator, as user gtobs-super.
+# Its writes are exactly the gtobs-super rows of deploy/write-matrix.tsv.
+# super authors no copy/; it writes copy-super/ in all three other stores and
+# reads all six copy directories (SPEC 9). It reads the trace like the other
+# three (-traces): trace-fresh against the proxy's tick line is every member's
+# check, not three members'. gt/ is inside the tree-root ReadOnlyPaths= and is
+# gt:gtring-trace 0750 with 0640 files, so reading it needs the group grant
+# below (SupplementaryGroups=gtring-trace), as on the other three.
+#
+# super's -cadence is the one every -heartbeat-max-age and ghostunnel's
+# --ring-heartbeat-max-age must exceed (README, "The cadence contract").
+[Unit]
+Description=ghostunnel observer ring: super (coordinator)
+Documentation=file:///usr/share/doc/ghostunnel-ring/README.md
+PartOf=ghostunnel-ring.target
+After=local-fs.target
+
+[Service]
+Type=simple
+User=gtobs-super
+Group=gtobs-super
+# Supplementary groups from /etc/group (setup-tree.sh): gtring-halts-tunnel,
+# gtring-halts-admin, gtring-halts-material, gtring-pem.
+# gt/ is gt:gtring-trace 0750 (tree.tsv): the trace is read through this
+# group and by nobody outside it. Stated here so check-units.sh --static can
+# refuse a unit without it (see ghostunnel-obs-tunnel.service).
+SupplementaryGroups=gtring-trace
+UMask=0022
+# observers.env for GT_EXPECT_POLICY_QUERY alone: every member re-judges
+# the tunnel surface, so the policy query is one value on all four. It is
+# the operator's expectation, never the proxy's own file. Passed with = so an empty
+# value (no policy deployed) cannot shift the next flag into its place.
+EnvironmentFile=/etc/ghostunnel/observers.env
+# -slot-owners is the account each member runs as, the User= of each
+# member's unit: an entry of this member's own halts/ named for a member
+# must be owned by that account (SPEC 10.2 H7), which is what makes a slot
+# created under another member's name the owner's own failing check (I8)
+# rather than a silent halt.
+# check-units.sh --static requires the mapping to equal the units' User=.
+ExecStart=/usr/local/bin/ghostunnel-obs-super \
+    -identity super \
+    -members tunnel,admin,material,super \
+    -coordinator super \
+    -copy-authors tunnel=material,admin=tunnel,material=admin \
+    -slot-owners tunnel=gtobs-tunnel,admin=gtobs-admin,material=gtobs-material,super=gtobs-super \
+    -stores /var/lib/ghostunnel-ring/stores \
+    -traces /var/lib/ghostunnel-ring/stores/gt \
+    -window 4 \
+    -min-cycle 300ms \
+    -cadence 10 \
+    -heartbeat-max-age 30s \
+    -policy-query=${GT_EXPECT_POLICY_QUERY}
+Restart=on-failure
+RestartSec=2s
+
+# ---- sandbox ----------------------------------------------------------------
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateNetwork=yes
+ProtectProc=invisible
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+ReadOnlyPaths=/var/lib/ghostunnel-ring/stores
+# Own store. (row: super)
+ReadWritePaths=/var/lib/ghostunnel-ring/stores/super
+# copy-super/ in each of the three others: what corroborates super's own
+# store. (rows: */copy-super)
+ReadWritePaths=/var/lib/ghostunnel-ring/stores/tunnel/copy-super
+ReadWritePaths=/var/lib/ghostunnel-ring/stores/admin/copy-super
+ReadWritePaths=/var/lib/ghostunnel-ring/stores/material/copy-super
+# The halts/ of every other member: only the slot halts/super and its .tmp.
+ReadWritePaths=/var/lib/ghostunnel-ring/stores/tunnel/halts
+ReadWritePaths=/var/lib/ghostunnel-ring/stores/admin/halts
+ReadWritePaths=/var/lib/ghostunnel-ring/stores/material/halts
+# Other members' directories inside the own store, remasked read-only: the
+# delivered halts and the three copies the others write here.
+ReadOnlyPaths=/var/lib/ghostunnel-ring/stores/super/halts
+ReadOnlyPaths=/var/lib/ghostunnel-ring/stores/super/copy-tunnel
+ReadOnlyPaths=/var/lib/ghostunnel-ring/stores/super/copy-admin
+ReadOnlyPaths=/var/lib/ghostunnel-ring/stores/super/copy-material
+
+[Install]
+WantedBy=ghostunnel-ring.target

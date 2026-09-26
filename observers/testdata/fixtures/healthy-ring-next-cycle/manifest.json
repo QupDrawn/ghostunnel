@@ -1,0 +1,74 @@
+{
+    "fixture": "healthy-ring-next-cycle",
+    "description": "The same ring one cycle later (window 42..45). Judged together with healthy-ring, an implementation must produce alive on both and commit to the advanced hashes.",
+    "rules": [
+        "SPEC 8.1",
+        "SPEC 6"
+    ],
+    "reader": "tunnel",
+    "reader_booted": false,
+    "parameters": {
+        "window": 4,
+        "stale_slack_cycles": 1,
+        "staging_stale_after_seconds": 60,
+        "max_heartbeat_bytes": 8192,
+        "max_fault_bytes": 8192,
+        "max_halt_bytes": 8192,
+        "now": "2026-09-20T10:07:35Z"
+    },
+    "directories": [
+        "stores/admin",
+        "stores/admin/copy",
+        "stores/admin/copy-super",
+        "stores/admin/copy-super/heartbeat",
+        "stores/admin/copy/heartbeat",
+        "stores/admin/halts",
+        "stores/admin/heartbeat",
+        "stores/material",
+        "stores/material/copy",
+        "stores/material/copy-super",
+        "stores/material/copy-super/heartbeat",
+        "stores/material/copy/heartbeat",
+        "stores/material/halts",
+        "stores/material/heartbeat",
+        "stores/super",
+        "stores/super/copy-admin",
+        "stores/super/copy-admin/heartbeat",
+        "stores/super/copy-material",
+        "stores/super/copy-material/heartbeat",
+        "stores/super/copy-tunnel",
+        "stores/super/copy-tunnel/heartbeat",
+        "stores/super/halts",
+        "stores/super/heartbeat",
+        "stores/tunnel",
+        "stores/tunnel/copy",
+        "stores/tunnel/copy-super",
+        "stores/tunnel/copy-super/heartbeat",
+        "stores/tunnel/copy/heartbeat",
+        "stores/tunnel/halts",
+        "stores/tunnel/heartbeat"
+    ],
+    "expect": {
+        "verdicts": {
+            "admin": "alive",
+            "material": "alive",
+            "super": "alive"
+        },
+        "failing": [],
+        "halt_in_force_before": false,
+        "halt": {
+            "writes": false
+        },
+        "publish": {
+            "sequence": 46,
+            "previous": "d0eed84c861544abc3ecfdb1113268655c5c6ab2ab5d5a4f46f76b0d7d1c7862",
+            "observed": {
+                "admin": "f3c8a5251e0ef33d70c35439b143ddd6a8e26476264faca52567da79457ab3e8",
+                "material": "33dfdc8505b6593c562f2d94d976a634b13c2fe71e2318252f54355671695302",
+                "super": "3b35a8e9df3c8ca21743c03cd5a8334f622f879316b25f761ce1e59a2ade62df"
+            },
+            "boot": null,
+            "stop": false
+        }
+    }
+}

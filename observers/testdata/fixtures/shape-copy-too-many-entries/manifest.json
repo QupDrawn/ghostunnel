@@ -1,0 +1,85 @@
+{
+    "fixture": "shape-copy-too-many-entries",
+    "description": "tunnel/copy/heartbeat/ holds six entries, more than WINDOW + 1. S3 (a compromise: no honest writer leaves six). The two oldest are also behind, so copy-current fails as well; the halt names S3 because C2 runs before K6.",
+    "rules": [
+        "SPEC 6.1 C2",
+        "SPEC 11.2"
+    ],
+    "reader": "tunnel",
+    "reader_booted": false,
+    "parameters": {
+        "window": 4,
+        "stale_slack_cycles": 1,
+        "staging_stale_after_seconds": 60,
+        "max_heartbeat_bytes": 8192,
+        "max_fault_bytes": 8192,
+        "max_halt_bytes": 8192,
+        "now": "2026-09-20T10:07:25Z"
+    },
+    "directories": [
+        "stores/admin",
+        "stores/admin/copy",
+        "stores/admin/copy-super",
+        "stores/admin/copy-super/heartbeat",
+        "stores/admin/copy/heartbeat",
+        "stores/admin/halts",
+        "stores/admin/heartbeat",
+        "stores/material",
+        "stores/material/copy",
+        "stores/material/copy-super",
+        "stores/material/copy-super/heartbeat",
+        "stores/material/copy/heartbeat",
+        "stores/material/halts",
+        "stores/material/heartbeat",
+        "stores/super",
+        "stores/super/copy-admin",
+        "stores/super/copy-admin/heartbeat",
+        "stores/super/copy-material",
+        "stores/super/copy-material/heartbeat",
+        "stores/super/copy-tunnel",
+        "stores/super/copy-tunnel/heartbeat",
+        "stores/super/halts",
+        "stores/super/heartbeat",
+        "stores/tunnel",
+        "stores/tunnel/copy",
+        "stores/tunnel/copy-super",
+        "stores/tunnel/copy-super/heartbeat",
+        "stores/tunnel/copy/heartbeat",
+        "stores/tunnel/halts",
+        "stores/tunnel/heartbeat"
+    ],
+    "expect": {
+        "verdicts": {
+            "admin": "alive",
+            "material": "alive",
+            "super": "alive"
+        },
+        "failing": [
+            {
+                "check": "S3",
+                "subject": "tunnel/copy/heartbeat"
+            },
+            {
+                "check": "copy-current",
+                "subject": "material"
+            }
+        ],
+        "halt_in_force_before": false,
+        "halt": {
+            "writes": true,
+            "reason": "S3",
+            "subject": "tunnel/copy/heartbeat"
+        },
+        "publish": {
+            "sequence": 45,
+            "previous": "cc8525634318a5c2ad79e4e0ccffc8dea9e5c68a1c2d132c13cfb2cf7b26fde0",
+            "observed": {
+                "admin": "b42e985aea6e4b2c15c530ce6c5d1e144b8d6e62a90351084ee9012885c8f0fa",
+                "material": "6ea99145c78a465d589be7b356b81d4248949d1155efd3fcd05a0f792085967e",
+                "super": "9a659a8389ae4f6ab7b8fb9dcada0cdd9ddaa56cd02eff0e5ab6cc559c057c12"
+            },
+            "boot": null,
+            "stop": false
+        }
+    }
+}

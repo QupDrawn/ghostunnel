@@ -1,0 +1,75 @@
+{
+    "fixture": "benign-cold-start-no-predecessor",
+    "description": "The reader has never run: no heartbeat folder of its own and no basis. The others are present. Every verdict is unknown; unknown is not a fault. The reader's first heartbeat is sequence 1 with a boot record.",
+    "rules": [
+        "SPEC 7",
+        "SPEC 8.1 V5"
+    ],
+    "reader": "tunnel",
+    "reader_booted": true,
+    "parameters": {
+        "window": 4,
+        "stale_slack_cycles": 1,
+        "staging_stale_after_seconds": 60,
+        "max_heartbeat_bytes": 8192,
+        "max_fault_bytes": 8192,
+        "max_halt_bytes": 8192,
+        "now": "2026-09-20T10:07:25Z"
+    },
+    "directories": [
+        "stores/admin",
+        "stores/admin/copy",
+        "stores/admin/copy-super",
+        "stores/admin/copy-super/heartbeat",
+        "stores/admin/copy/heartbeat",
+        "stores/admin/halts",
+        "stores/admin/heartbeat",
+        "stores/material",
+        "stores/material/copy",
+        "stores/material/copy-super",
+        "stores/material/copy-super/heartbeat",
+        "stores/material/copy/heartbeat",
+        "stores/material/halts",
+        "stores/material/heartbeat",
+        "stores/super",
+        "stores/super/copy-admin",
+        "stores/super/copy-admin/heartbeat",
+        "stores/super/copy-material",
+        "stores/super/copy-material/heartbeat",
+        "stores/super/copy-tunnel",
+        "stores/super/copy-tunnel/heartbeat",
+        "stores/super/halts",
+        "stores/super/heartbeat",
+        "stores/tunnel",
+        "stores/tunnel/copy",
+        "stores/tunnel/copy-super",
+        "stores/tunnel/copy-super/heartbeat",
+        "stores/tunnel/copy/heartbeat",
+        "stores/tunnel/halts"
+    ],
+    "expect": {
+        "verdicts": {
+            "admin": "unknown",
+            "material": "unknown",
+            "super": "unknown"
+        },
+        "failing": [],
+        "halt_in_force_before": false,
+        "halt": {
+            "writes": false
+        },
+        "publish": {
+            "sequence": 1,
+            "previous": null,
+            "observed": {
+                "admin": "0b9281a2bf91fb57134303b6101a5eab6d341b199febf0eb930602f34f2b32ca",
+                "material": "adc4201b2e3cea9362ce01827b3d210fd1515b41911bc38868e1ac162de6191a",
+                "super": "525ba44e17882f07e796644bd9a9e402c46e8a260bed33bf20ba9acbceddb506"
+            },
+            "boot": {
+                "resumed_from": null
+            },
+            "stop": false
+        }
+    }
+}

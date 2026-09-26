@@ -1,0 +1,81 @@
+{
+    "fixture": "inv3-null-previous-above-one",
+    "description": "admin's 44 carries previous: null. Only sequence 1 may; a null above 1 is a chain restarted without restarting its numbering. I3.",
+    "rules": [
+        "SPEC 6.1 C7",
+        "SPEC 11.1 I3"
+    ],
+    "reader": "tunnel",
+    "reader_booted": false,
+    "parameters": {
+        "window": 4,
+        "stale_slack_cycles": 1,
+        "staging_stale_after_seconds": 60,
+        "max_heartbeat_bytes": 8192,
+        "max_fault_bytes": 8192,
+        "max_halt_bytes": 8192,
+        "now": "2026-09-20T10:07:25Z"
+    },
+    "directories": [
+        "stores/admin",
+        "stores/admin/copy",
+        "stores/admin/copy-super",
+        "stores/admin/copy-super/heartbeat",
+        "stores/admin/copy/heartbeat",
+        "stores/admin/halts",
+        "stores/admin/heartbeat",
+        "stores/material",
+        "stores/material/copy",
+        "stores/material/copy-super",
+        "stores/material/copy-super/heartbeat",
+        "stores/material/copy/heartbeat",
+        "stores/material/halts",
+        "stores/material/heartbeat",
+        "stores/super",
+        "stores/super/copy-admin",
+        "stores/super/copy-admin/heartbeat",
+        "stores/super/copy-material",
+        "stores/super/copy-material/heartbeat",
+        "stores/super/copy-tunnel",
+        "stores/super/copy-tunnel/heartbeat",
+        "stores/super/halts",
+        "stores/super/heartbeat",
+        "stores/tunnel",
+        "stores/tunnel/copy",
+        "stores/tunnel/copy-super",
+        "stores/tunnel/copy-super/heartbeat",
+        "stores/tunnel/copy/heartbeat",
+        "stores/tunnel/halts",
+        "stores/tunnel/heartbeat"
+    ],
+    "expect": {
+        "verdicts": {
+            "admin": "alive",
+            "material": "alive",
+            "super": "alive"
+        },
+        "failing": [
+            {
+                "check": "I3",
+                "subject": "admin"
+            }
+        ],
+        "halt_in_force_before": false,
+        "halt": {
+            "writes": true,
+            "reason": "I3",
+            "subject": "admin"
+        },
+        "publish": {
+            "sequence": 45,
+            "previous": "20b44e5a1dabe143fa9e74e896348f1527f63d364757cdaf36ba1ac15b090a67",
+            "observed": {
+                "admin": "de76595ceeb6e6c222a493c724f8a82a81596362096c185ccb0cf6311b46e65d",
+                "material": "eeaac2b6ca98aec552d5c50651310f359b58f1a8215748bc57551103310a92ad",
+                "super": "d490a767f653a51a8b6b9ef81e75c77c54d8ba112c0de13f449dafd5a2411971"
+            },
+            "boot": null,
+            "stop": false
+        }
+    }
+}
