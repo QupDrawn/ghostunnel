@@ -22,7 +22,7 @@ const tunnelNow = "2026-09-24T12:00:00Z"
 // tickets on with verification re-run on resumption, and the test PKI's
 // CA bundle as the trust material the substance rules verify chains
 // against (gtreader_test.go, gtPKI).
-const tunnelConfig = `{"mode":"server","listen":"localhost:8443","target":"localhost:8080","proxy_protocol":"off","status_listen":"127.0.0.1:6060","status_client_cert":false,"pprof_cmdline_redacted":true,"shutdown_requires_client_cert":true,"session_tickets":true,"verify_on_resume":true,"acl":["allow-cn:client.example"],"lifetime_cap_seconds":300,"sandbox_state":"applied","sandbox_accepted":null,"material":[{"material":"ca","path":"../testdata/pki/ca.pem","sha256":"` + gtCAHash + `"}]}`
+const tunnelConfig = `{"mode":"server","listen":"localhost:8443","target":"localhost:8080","proxy_protocol":"off","status_listen":"127.0.0.1:6060","status_client_cert":false,"pprof_cmdline_redacted":true,"shutdown_requires_client_cert":true,"session_tickets":true,"verify_on_resume":true,"acl":["allow-cn:client.example"],"lifetime_cap_seconds":300,"sandbox_state":"applied","sandbox_accepted":null,"material":[{"material":"ca","path":"../testdata/pki/ca.pem","sha256":"` + gtCAHash + `"}],"binary":{"path":"/usr/local/bin/ghostunnel","sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}`
 
 func tHdr(kind string, seq int, at string) string {
 	return fmt.Sprintf(`{"kind":"%s","version":1,"sequence":%d,"at":"%s"`, kind, seq, at)

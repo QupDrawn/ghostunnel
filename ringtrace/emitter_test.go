@@ -23,6 +23,7 @@ func testConfig() Config {
 			{Material: "cert", Path: "/etc/gt/server.crt", SHA256: &cert},
 			{Material: "key", Path: "/etc/gt/server.key"},
 		},
+		Binary: testBinary,
 	}
 }
 

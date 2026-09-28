@@ -190,9 +190,18 @@ func runRemote(o *options) (string, error) {
 		args = append(args, "-order", o.order)
 	}
 	if o.forkArgs != "" {
-		args = append(args, "-fork-args", "'"+o.forkArgs+"'")
+		args = append(args, "-fork-args", o.forkArgs)
 	}
-	remote := "cd " + o.remoteBench + " && export PATH=$PATH:/usr/local/go/bin && go run . " + strings.Join(args, " ")
+	for _, p := range []string{o.remoteBench, o.remoteRepo, o.remoteWork} {
+		if err := checkRemotePath(p); err != nil {
+			return "", err
+		}
+	}
+	quoted := make([]string, len(args))
+	for i, a := range args {
+		quoted[i] = shellWord(a)
+	}
+	remote := "cd " + shellWord(o.remoteBench) + " && export PATH=$PATH:/usr/local/go/bin && go run . " + strings.Join(quoted, " ")
 	progress("running on %s: %s", o.host, remote)
 	cmd := o.ssh(remote)
 	stderr, err := cmd.StderrPipe()
@@ -231,8 +240,42 @@ func (o *options) resultsDir() string {
 	return o.remoteBench + "/work/results"
 }
 
+// shellWord quotes s as one word for the remote POSIX shell, which is what
+// ssh hands the command string to: single quotes around everything, each
+// embedded single quote closed, escaped and reopened. A bare "~" and a
+// leading "~/" stay outside the quotes so the remote shell still expands
+// them to the home directory.
+func shellWord(s string) string {
+	if s == "~" {
+		return s
+	}
+	prefix := ""
+	if strings.HasPrefix(s, "~/") {
+		prefix, s = "~/", s[2:]
+	}
+	if s == "" {
+		return prefix + "''"
+	}
+	return prefix + "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// checkRemotePath refuses a remote path that is not absolute on the remote
+// host or relative to its home directory. A Windows shell such as Git Bash
+// rewrites an argument like /var/lib/x into C:/Program Files/Git/var/lib/x
+// before this program sees it, and a run on the rewritten path would write
+// somewhere else on the remote host without saying so.
+func checkRemotePath(p string) error {
+	if p == "" || strings.HasPrefix(p, "/") || strings.HasPrefix(p, "~/") || p == "~" {
+		return nil
+	}
+	return fmt.Errorf("remote path %q is neither absolute nor under ~/ on the remote host (on Windows, Git Bash rewrites leading-slash arguments; set MSYS_NO_PATHCONV=1)", p)
+}
+
 func newestRemoteStamp(o *options) (string, error) {
-	out, err := o.ssh("ls " + o.resultsDir()).Output()
+	if err := checkRemotePath(o.resultsDir()); err != nil {
+		return "", err
+	}
+	out, err := o.ssh("ls " + shellWord(o.resultsDir())).Output()
 	if err != nil {
 		return "", fmt.Errorf("listing the results on %s: %w", o.host, err)
 	}
@@ -254,6 +297,9 @@ func newestRemoteStamp(o *options) (string, error) {
 func fetchReport(o *options, stamp string) (string, error) {
 	results := filepath.Join(sourceDir(), "work", "results")
 	if err := os.MkdirAll(results, 0o755); err != nil {
+		return "", err
+	}
+	if err := checkRemotePath(o.resultsDir()); err != nil {
 		return "", err
 	}
 	remote := o.resultsDir() + "/" + stamp

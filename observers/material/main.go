@@ -116,6 +116,7 @@ func parseFlags(args []string) (*Config, time.Duration, int64, error) {
 	fs.DurationVar(&local.TunnelMargins.ACLGrace, "tunnel-acl-grace", defaultACLGrace, "the tunnel member's -acl-grace, which this member judges the tunnel surface with")
 	fs.DurationVar(&local.TunnelMargins.TickMaxAge, "tick-max-age", defaultTickMaxAge, "how old the proxy's newest tick line may be before tick-fresh fails, and how far back accept-loop looks; must exceed the proxy's --ring-tick (default 5s) by a margin, and be the same on every member")
 	fs.StringVar(&local.AcceptNoSandbox, "accept-no-sandbox", "", "the OS this observer runs on, as Go names it, to accept that it has no process sandbox; refused unless it equals this OS exactly, and refused on linux, where the facility exists; sandbox-applied then passes only when ghostunnel's start line carries the same acceptance")
+	fs.StringVar(&local.ExpectBinarySHA256, "expect-binary-sha256", "", "the SHA-256 the operator expects of the proxy's executable, 64 lower-case hex characters, from the release's SBOM or the build's checksum at install; required: binary-expected fails unless the start line records exactly this hash and the file at its path still hashes to it")
 	fs.StringVar(&cfg.Identity, "identity", "material", "this observer's identity (its store name)")
 	fs.StringVar(&members, "members", "tunnel,admin,material,super", "the declared membership, comma-separated, including this identity")
 	fs.StringVar(&cfg.Coordinator, "coordinator", "super", "the member that decides the all-clear")
@@ -178,6 +179,9 @@ func parseFlags(args []string) (*Config, time.Duration, int64, error) {
 	if err := acceptNoSandboxValid(local.AcceptNoSandbox, local.GOOS); err != nil {
 		return nil, 0, 0, err
 	}
+	if err := expectBinaryValid(local.ExpectBinarySHA256); err != nil {
+		return nil, 0, 0, err
+	}
 	if local.ProcRoot == "" {
 		return nil, 0, 0, fmt.Errorf("proc must name the process table")
 	}
@@ -202,6 +206,22 @@ func parseFlags(args []string) (*Config, time.Duration, int64, error) {
 		cfg.OwnTree, _ = readStoreTree(tree, cfg.Identity)
 	}
 	return cfg, minCycle, cycles, nil
+}
+
+// expectBinaryValid is the parser's rule for -expect-binary-sha256: exactly
+// 64 lower-case hex characters, the form of the start line's
+// config.binary.sha256, of sha256sum's output and of an SPDX SHA256
+// checksumValue. An absent value is refused: an operator who expects no
+// particular build has not said which build the ring must hold the proxy
+// to.
+func expectBinaryValid(value string) error {
+	if value == "" {
+		return fmt.Errorf("expect-binary-sha256 is required: the SHA-256 of the proxy's executable, from the release's SBOM or sha256sum at install")
+	}
+	if len(value) != 64 || strings.Trim(value, "0123456789abcdef") != "" {
+		return fmt.Errorf("expect-binary-sha256=%q is not 64 lower-case hex characters", value)
+	}
+	return nil
 }
 
 // acceptNoSandboxValid is the parser's rule for -accept-no-sandbox: unset

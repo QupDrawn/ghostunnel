@@ -834,6 +834,10 @@ func run(args []string) error {
 	// OS. Both are checked by serverValidateFlags and clientValidateFlags
 	// below and again by openRing before any listener binds.
 	pkcs11Enabled := pkcs11Module != nil && *pkcs11Module != ""
+	// The start line's record of the executable is taken here, before the
+	// sandbox: landlock grants no read of the executable. A failure is
+	// kept and refuses the start at ringConfig.
+	_, _ = recordRingBinary()
 	sandboxOutcome = decideSandbox(pkcs11Enabled)
 	logger.Printf("process sandbox: %s", sandboxOutcome)
 
@@ -1078,7 +1082,7 @@ func serverListen(env *Environment, regoPolicy policy.Policy) error {
 	ringCfg, ringCA, err := ringConfig("server", *serverListenAddress, *serverForwardAddress, serverProxyProtoMode(), serverConfig.GetServerConfig(), sandboxState(), *serverAllowPolicy,
 		ringRules{acl: serverACL, uris: *serverAllowedURIs, disableAuth: *serverDisableAuth})
 	if err != nil {
-		logger.Printf("error: unable to read trust material for the ring trace: %s", err)
+		logger.Printf("error: unable to record the configuration for the ring trace: %s", err)
 		return err
 	}
 	env.ring, err = openRing(ringCfg, ringCA, serverACL, !*serverDisableAuth, *serverAllowPolicy)
@@ -1149,7 +1153,7 @@ func clientListen(env *Environment) error {
 	ringCfg, ringCA, err := ringConfig("client", *clientListenAddress, *clientForwardAddress, proxy.ProxyProtocolOff, nil, sandboxState(), *clientAllowPolicy,
 		ringRules{acl: acl, uris: *clientAllowedURIs, disableAuth: *clientDisableAuth})
 	if err != nil {
-		logger.Printf("error: unable to read trust material for the ring trace: %s", err)
+		logger.Printf("error: unable to record the configuration for the ring trace: %s", err)
 		return err
 	}
 	env.ring, err = openRing(ringCfg, ringCA, acl, true, *clientAllowPolicy)

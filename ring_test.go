@@ -1292,6 +1292,114 @@ func TestRingConfigRecordsProxyProtocol(t *testing.T) {
 	assert.Error(t, err, "a mode the trace cannot name is refused")
 }
 
+// testRingBinary is the config.binary of the start lines these tests
+// write by hand.
+var testRingBinary = ringtrace.Binary{Path: "/usr/local/bin/ghostunnel", SHA256: strings.Repeat("b", 64)}
+
+// TestRingConfigRecordsBinary: the start line names the executable this
+// process runs, the test binary here, by its path with every link
+// resolved and the SHA-256 of its bytes; an executable that cannot be
+// named, resolved or read refuses the configuration, and so the start.
+func TestRingConfigRecordsBinary(t *testing.T) {
+	pki := newRingPKI(t)
+	savedCA := *caBundlePath
+	*caBundlePath = pki.caPath
+	t.Cleanup(func() { *caBundlePath = savedCA })
+	exe, err := os.Executable()
+	require.NoError(t, err)
+	path, err := filepath.EvalSymlinks(exe)
+	require.NoError(t, err)
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	sum := sha256.Sum256(data)
+
+	savedRecord := ringStartBinary
+	t.Cleanup(func() { ringStartBinary = savedRecord })
+	ringStartBinary = &ringBinaryRecord{}
+	cfg, _, err := ringConfig("server", "a", "b", proxy.ProxyProtocolOff, nil, ringtrace.SandboxApplied, "", ringRules{acl: auth.ACL{AllowAll: true}})
+	require.NoError(t, err)
+	assert.Equal(t, ringtrace.Binary{Path: path, SHA256: hex.EncodeToString(sum[:])}, cfg.Binary)
+	line, err := ringtrace.EncodeLine(ringtrace.Record{Sequence: 1, At: time.Now(), Body: &ringtrace.Start{Boot: 1, PID: 1, Config: cfg}})
+	require.NoError(t, err)
+	assert.Contains(t, string(line), `"binary":{"path":`)
+	assert.Contains(t, string(line), `"sha256":"`+hex.EncodeToString(sum[:])+`"}}}`)
+
+	// The record is taken once: a later change of the executable's name
+	// does not move it.
+	savedExe := ringExecutable
+	t.Cleanup(func() { ringExecutable = savedExe })
+	ringExecutable = func() (string, error) { return "", errors.New("no executable") }
+	again, _, err := ringConfig("server", "a", "b", proxy.ProxyProtocolOff, nil, ringtrace.SandboxApplied, "", ringRules{acl: auth.ACL{AllowAll: true}})
+	require.NoError(t, err)
+	assert.Equal(t, cfg.Binary, again.Binary)
+	ringExecutable = savedExe
+
+	// The file hashed is the one this process was executed from: on Linux
+	// /proc/self/exe, elsewhere the resolved path.
+	if runtime.GOOS == "linux" {
+		assert.Equal(t, "/proc/self/exe", ringExecutableImage(path))
+	} else {
+		assert.Equal(t, path, ringExecutableImage(path))
+	}
+	savedImage := ringExecutableImage
+	t.Cleanup(func() { ringExecutableImage = savedImage })
+	ringExecutableImage = func(p string) string { return p }
+
+	// Through a symbolic link: the link is resolved to the file it names.
+	dir := t.TempDir()
+	target := filepath.Join(dir, "ghostunnel-real")
+	require.NoError(t, os.WriteFile(target, []byte("a stand-in executable"), 0o755))
+	link := filepath.Join(dir, "ghostunnel")
+	if err := os.Symlink(target, link); err == nil {
+		ringExecutable = func() (string, error) { return link, nil }
+		got, err := ringBinary()
+		ringExecutable = savedExe
+		require.NoError(t, err)
+		resolved, err := filepath.EvalSymlinks(target)
+		require.NoError(t, err)
+		standIn := sha256.Sum256([]byte("a stand-in executable"))
+		assert.Equal(t, ringtrace.Binary{Path: resolved, SHA256: hex.EncodeToString(standIn[:])}, got)
+	} else {
+		t.Logf("no symbolic link on this host (%v); the link case is not exercised", err)
+	}
+
+	for name, exe := range map[string]func() (string, error){
+		"not named":   func() (string, error) { return "", errors.New("no executable") },
+		"missing":     func() (string, error) { return filepath.Join(dir, "absent"), nil },
+		"a directory": func() (string, error) { return dir, nil },
+	} {
+		ringStartBinary = &ringBinaryRecord{}
+		ringExecutable = exe
+		_, _, err := ringConfig("server", "a", "b", proxy.ProxyProtocolOff, nil, ringtrace.SandboxApplied, "", ringRules{acl: auth.ACL{AllowAll: true}})
+		ringExecutable = savedExe
+		assert.Error(t, err, "%s: an executable that cannot be hashed refuses the start", name)
+	}
+}
+
+// TestRunRecordsBinaryBeforeSandbox: run takes the executable's record
+// before the process sandbox applies, since landlock grants no read of the
+// executable.
+func TestRunRecordsBinaryBeforeSandbox(t *testing.T) {
+	savedRecord := ringStartBinary
+	t.Cleanup(func() { ringStartBinary = savedRecord })
+	fresh := &ringBinaryRecord{}
+	ringStartBinary = fresh
+	origDecide := decideSandbox
+	t.Cleanup(func() { decideSandbox = origDecide })
+	takenAtSandbox := false
+	decideSandbox = func(bool) string {
+		takenAtSandbox = fresh.taken
+		return ringtrace.SandboxApplied
+	}
+	cmd := []string{"server", "--cacert", "/dev/null", "--target", "localhost:8080", "--keystore", "keystore.p12", "--listen", "localhost:8080"}
+	if runtime.GOOS != "linux" {
+		cmd = append(cmd, "--accept-no-sandbox="+runtime.GOOS)
+	}
+	assert.Error(t, run(cmd), "the invalid CA bundle ends the run after the sandbox")
+	assert.True(t, takenAtSandbox, "the record was taken before the sandbox was decided")
+	assert.NoError(t, fresh.err)
+}
+
 func TestACLRules(t *testing.T) {
 	hash := "c" + strings.Repeat("2", 63)
 	withPolicy := []ringtrace.Material{{Material: "policy", Path: "p.rego", SHA256: &hash}}
@@ -1326,7 +1434,7 @@ func TestACLRules(t *testing.T) {
 			got, err := aclRules(c.mode, c.rules, c.material)
 			require.NoError(t, err)
 			assert.Equal(t, c.want, got)
-			cfg := ringtrace.Config{Mode: c.mode, Listen: "a", Target: "b", ProxyProtocol: ringtrace.ProxyProtocolOff, ACL: got, SandboxState: ringtrace.SandboxApplied, Material: []ringtrace.Material{}}
+			cfg := ringtrace.Config{Mode: c.mode, Listen: "a", Target: "b", ProxyProtocol: ringtrace.ProxyProtocolOff, ACL: got, SandboxState: ringtrace.SandboxApplied, Material: []ringtrace.Material{}, Binary: testRingBinary}
 			_, err = ringtrace.EncodeLine(ringtrace.Record{Sequence: 1, At: time.Now(), Body: &ringtrace.Start{Boot: 1, PID: 1, Config: cfg}})
 			assert.NoError(t, err, "every description is in the format's vocabulary")
 		})
@@ -1416,7 +1524,7 @@ func TestRingTicksStopOnEmitterFailure(t *testing.T) {
 func TestRingRecordsAcceptErrors(t *testing.T) {
 	traces := t.TempDir()
 	emitter, err := ringtrace.Open(traces, ringtrace.Options{Config: ringtrace.Config{
-		Mode: "server", Listen: "a", Target: "b", ProxyProtocol: ringtrace.ProxyProtocolOff, ACL: []string{"allow-all"}, SandboxState: ringtrace.SandboxApplied, Material: []ringtrace.Material{},
+		Mode: "server", Listen: "a", Target: "b", ProxyProtocol: ringtrace.ProxyProtocolOff, ACL: []string{"allow-all"}, SandboxState: ringtrace.SandboxApplied, Material: []ringtrace.Material{}, Binary: testRingBinary,
 	}})
 	require.NoError(t, err)
 	r := &ring{emitter: emitter, stop: make(chan struct{})}
@@ -1822,6 +1930,7 @@ func handRing(t *testing.T, mode, stores string) (*ring, string, *stateClock) {
 		Mode: mode, Listen: "127.0.0.1:8443", Target: "127.0.0.1:8080", ProxyProtocol: ringtrace.ProxyProtocolOff,
 		ACL: []string{"disable-authentication"}, SandboxState: ringtrace.SandboxUnsupported,
 		Material: []ringtrace.Material{{Material: "cert", Path: "/etc/gt/server.crt"}, {Material: "key", Path: "/etc/gt/server.key"}},
+		Binary:   testRingBinary,
 	}
 	if mode == "client" {
 		cfg.ACL = []string{"verify-hostname"}

@@ -87,6 +87,7 @@ serves.
 | `sandbox_state` | `"applied"`, `"unsupported"`, `"disabled"`, `"failed"` or `"skipped"` | the outcome of the process sandbox attempt at startup (below) |
 | `sandbox_accepted` | non-empty string or `null` | the OS an operator named with `--accept-no-sandbox`, else `null` |
 | `material` | array (may be empty, never `null`) of material objects | the trust material as loaded |
+| `binary` | object: `path`, non-empty string; `sha256`, hash | the executable this process started from (below) |
 
 `proxy_protocol` is what the backend is handed ahead of every connection's
 bytes, and so, with `target`, what the backend receives: `off`, nothing
@@ -164,6 +165,15 @@ policy is configured. A `--keystore` holds the key, so it appears as both
 `cert` and `key`, both without a hash; a `--cacert` of `""` is the system
 trust store, listed with an empty path; a keychain, PKCS#11, SPIFFE or ACME
 source has no file and is listed with an empty path.
+
+`binary` names the file this process was executed from and its hash.
+`path` is `os.Executable()` with every symbolic link resolved. `sha256` is
+the SHA-256 of the executed file's bytes, read once at startup, before the
+process sandbox applies; on Linux the bytes are read through
+`/proc/self/exe`, so a path replaced after the exec does not change them.
+ghostunnel refuses to start when it cannot resolve or read its own
+executable. The key is required: a `start` line without it, or with an
+empty `path` or a `sha256` that is not a hash, is malformed.
 
 **`accept`**: a connection was accepted on the tunnel listener.
 
@@ -866,15 +876,15 @@ the same schedule at worst: the watch's full scan every second is what
 closes a served connection when a halt lands. So the bound on a halt
 reaching a served connection is ≤ 1 s, and a change the kernel reports is
 seen by the next accept, since every accept drains the notification before
-deciding. **The residual, stated exactly:** a change the kernel does not report is seen at
-the next scheduled scan, within 1 s. That is: a write through a shared
-mapping without `msync`, a mount placed over a watched directory, a watcher
-that is not running, and, on Windows, a change to a file's *content* only
-(the last-write and size notifications are delivered when the cache
-flushes, while name changes are delivered at once; the gate decides halts,
-faults and delivered halts by name, and the heartbeat is judged by name and
-by its age on every reuse). Nothing is keyed on a size or a modification
-time.
+deciding. **The residual, stated exactly:** a change the kernel does
+not report is seen at the next scheduled scan, within 1 s. Four cases
+go unreported: a write through a shared mapping without `msync`, a
+mount placed over a watched directory, any change while the watcher is
+not running, and, on Windows, a change to a file's *content* only (the
+last-write and size notifications are delivered when the cache flushes,
+while name changes are delivered at once; the gate decides halts, faults
+and delivered halts by name, and the heartbeat is judged by name and by its
+age on every reuse). Nothing is keyed on a size or a modification time.
 
 ## 4. Tests
 

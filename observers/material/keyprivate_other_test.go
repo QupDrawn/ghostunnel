@@ -19,7 +19,7 @@ func TestMaterialKeyPrivateUnsupportedHere(t *testing.T) {
 	}
 	f := mMaterial(t)
 	root := materialTree(t, materialHealthy(f)...)
-	checks := MaterialChecks{Live: procLiveness(blTable(t, 4242)), KeyProbe: platformKeyProbe}
+	checks := MaterialChecks{Live: procLiveness(blTable(t, 4242)), KeyProbe: platformKeyProbe, ExpectBinarySHA256: mBinarySHA}
 	got := materialSorted(checks.Run(&Config{TracesRoot: root, Now: mNow(t)}, &State{}, nil))
 	materialWant(t, got, Finding{"key-private", "unsupported-os:" + runtime.GOOS})
 }

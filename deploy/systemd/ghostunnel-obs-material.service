@@ -5,6 +5,10 @@
 # cert, CA and policy are read whole and hashed (root:gtring-pem 0640, and
 # gtobs-material is in gtring-pem); the key is only stat'ed (root:gt 0640, so
 # this user cannot read it). /etc is read-only under ProtectSystem=strict.
+# It also reads the ghostunnel executable the start line names
+# (/usr/local/bin/ghostunnel, root:root 0755) whole and hashes it every
+# cycle, for binary-expected; /usr stays readable under ProtectSystem=strict,
+# read-only.
 [Unit]
 Description=ghostunnel observer ring: material member
 Documentation=file:///usr/share/doc/ghostunnel-ring/README.md
@@ -22,11 +26,16 @@ Group=gtobs-material
 # refuse a unit without it (see ghostunnel-obs-tunnel.service).
 SupplementaryGroups=gtring-trace
 UMask=0022
-# observers.env for GT_EXPECT_POLICY_QUERY alone: every member re-judges
-# the tunnel surface, so the policy query is one value on all four. It is
-# the operator's expectation, never the proxy's own file. Passed with = so an empty
-# value (no policy deployed) cannot shift the next flag into its place.
+# observers.env for GT_EXPECT_POLICY_QUERY and GT_EXPECT_BINARY_SHA256.
+# Every member re-judges the tunnel surface, so the policy query is one
+# value on all four; the binary checksum is this member's alone. Both are
+# the operator's expectation, never the proxy's own file. The policy query
+# is passed with = so an empty value (no policy deployed) cannot shift the
+# next flag into its place. The checksum is tested non-empty before the
+# start, and the member refuses any value that is not 64 lower-case hex
+# characters.
 EnvironmentFile=/etc/ghostunnel/observers.env
+ExecStartPre=/usr/bin/test -n "${GT_EXPECT_BINARY_SHA256}"
 # -slot-owners is the account each member runs as, the User= of each
 # member's unit: an entry of this member's own halts/ named for a member
 # must be owned by that account (SPEC 10.2 H7), which is what makes a slot
@@ -45,6 +54,7 @@ ExecStart=/usr/local/bin/ghostunnel-obs-material \
     -min-cycle 300ms \
     -cadence 10 \
     -heartbeat-max-age 30s \
+    -expect-binary-sha256 ${GT_EXPECT_BINARY_SHA256} \
     -policy-query=${GT_EXPECT_POLICY_QUERY}
 Restart=on-failure
 RestartSec=2s

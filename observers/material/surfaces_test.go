@@ -87,7 +87,7 @@ func TestSurfaceRingIdentifiers(t *testing.T) {
 			all[id] = true
 		}
 	}
-	for _, id := range []string{"trace-readable", "listener-expected", "target-expected", "acl-expected", "proxy-protocol-expected", "cmdline-carries-no-secret", "proxy-process-alive", "material-loaded", "key-private", "sandbox-applied", "tick-fresh", "trace-consistent", "boot-ambiguous"} {
+	for _, id := range []string{"trace-readable", "listener-expected", "target-expected", "acl-expected", "proxy-protocol-expected", "cmdline-carries-no-secret", "proxy-process-alive", "material-loaded", "binary-expected", "key-private", "sandbox-applied", "tick-fresh", "trace-consistent", "boot-ambiguous"} {
 		if all[id] {
 			t.Errorf("%s is a file, process or every-member check and must stay with its owner", id)
 		}

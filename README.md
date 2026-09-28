@@ -26,6 +26,12 @@ full and still holds level with base:
 
 ![bench: fork against base without the warm backend pool](pics/2.png)
 
+The lead depends on how far away the backend is. The pool hides the dial,
+so the longer the dial, the more it hides. Both runs above cross a zone
+boundary. With the echo in the bench host's own zone, over 33 rounds, the
+fork serves connections one at a time about 12% faster, and sixteen at
+once about 3% faster.
+
 `bench/README.md` says how to run it and what the host needs.
 
 The fork in one page
@@ -153,6 +159,11 @@ ring declares.
   in bounded chunks, and `trace-consistent` remembers the hash of the
   prefix it read and halts if that prefix changes, shrinks or vanishes
   (SPEC 14, `ringtrace/README.md` 1.3).
+- **The proxy runs the build the operator expects.** The start line records
+  the SHA-256 of the proxy's executable, and `binary-expected` in the
+  material member re-hashes that file every cycle. It halts unless the file
+  still matches the record and the record is the checksum the operator took
+  from the build output where the build is reviewed.
 - **A member that cannot answer has not passed.** An unreadable store, a
   heartbeat that will not parse, a chain that will not verify, a trace that
   cannot be read, a process table that cannot be seen: each fails the check
@@ -166,9 +177,10 @@ kernel and one service manager, and whoever holds the host holds all of
 them. It cannot stop a proxy rewritten not to consult the gate; it detects
 one, because the connections such a proxy serves are in a trace every
 member re-verifies, and a proxy whose trace stops is one every member
-reports. It does not establish which build was intended, that a store
-bearing a member's name was meant to be that member, or anything about its
-own code (SPEC 20).
+reports. It holds the installed binary to the build's checksum but does not
+establish that the build was the intended one. It does not
+establish that a store bearing a member's name was meant to be that
+member, or anything about its own code (SPEC 20).
 
 Where to read next
 ------------------

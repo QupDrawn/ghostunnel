@@ -9,6 +9,9 @@ import (
 	"time"
 )
 
+// testBinary is the config.binary every sample start line carries.
+var testBinary = Binary{Path: "/usr/local/bin/ghostunnel", SHA256: strings.Repeat("b", 64)}
+
 // sampleBodies is one well-formed body of every kind, used by the round-trip
 // tests here and by the emitter and reader tests.
 func sampleBodies() []Body {
@@ -31,6 +34,7 @@ func sampleBodies() []Body {
 					{Material: "ca", Path: "/etc/gt/ca.pem", SHA256: &ca},
 					{Material: "policy", Path: "", SHA256: nil},
 				},
+				Binary: testBinary,
 			},
 		},
 		&Accept{Conn: 1, Listener: "0.0.0.0:8443", Remote: "10.0.0.7:51234"},
@@ -181,8 +185,8 @@ func TestEncodeRejects(t *testing.T) {
 		"pem in san":       {Sequence: 1, At: at, Body: &Handshake{Conn: 1, Outcome: "ok", Verified: true, Protocol: "TLS1.3", Peer: &Peer{Subject: "s", Issuer: "i", Serial: "1", SANs: []string{"-----BEGIN EC PRIVATE KEY-----"}, Fingerprint: hash}}},
 		"empty listener":   {Sequence: 1, At: at, Body: &Accept{Conn: 1, Listener: "", Remote: "b"}},
 		"zero conn":        {Sequence: 1, At: at, Body: &Accept{Conn: 0, Listener: "a", Remote: "b"}},
-		"start boot zero":  {Sequence: 1, At: at, Body: &Start{Boot: 0, PID: 1, Config: Config{Mode: "server", Listen: "a", Target: "b", ProxyProtocol: ProxyProtocolOff, ACL: []string{"allow-all"}, SandboxState: SandboxApplied, Material: []Material{}}}},
-		"start bad mode":   {Sequence: 1, At: at, Body: &Start{Boot: 1, PID: 1, Config: Config{Mode: "proxy", Listen: "a", Target: "b", ProxyProtocol: ProxyProtocolOff, ACL: []string{"allow-all"}, SandboxState: SandboxApplied, Material: []Material{}}}},
+		"start boot zero":  {Sequence: 1, At: at, Body: &Start{Boot: 0, PID: 1, Config: Config{Mode: "server", Listen: "a", Target: "b", ProxyProtocol: ProxyProtocolOff, ACL: []string{"allow-all"}, SandboxState: SandboxApplied, Material: []Material{}, Binary: testBinary}}},
+		"start bad mode":   {Sequence: 1, At: at, Body: &Start{Boot: 1, PID: 1, Config: Config{Mode: "proxy", Listen: "a", Target: "b", ProxyProtocol: ProxyProtocolOff, ACL: []string{"allow-all"}, SandboxState: SandboxApplied, Material: []Material{}, Binary: testBinary}}},
 		"bad chain":        {Sequence: 1, At: at, Body: &Handshake{Conn: 1, Outcome: "ok", Verified: true, Protocol: "TLS1.3", Chain: "abc"}},
 		"upper-case chain": {Sequence: 1, At: at, Body: &Handshake{Conn: 1, Outcome: "ok", Verified: true, Protocol: "TLS1.3", Chain: strings.ToUpper(hash[:63]) + "A"}},
 	}
@@ -321,11 +325,11 @@ func TestConfigCarriesAdminSurface(t *testing.T) {
 	if !strings.Contains(joined, strings.Join(want, ",")) {
 		t.Fatalf("ConfigKeys = %v, want %v in that order", ConfigKeys, want)
 	}
-	old := `{"kind":"start","version":1,"sequence":1,"at":"2026-09-24T10:07:00Z","boot":1,"pid":1,"config":{"mode":"server","listen":"a","target":"b","proxy_protocol":"off","status_listen":null,"status_client_cert":false,"session_tickets":false,"verify_on_resume":true,"acl":["allow-all"],"lifetime_cap_seconds":0,"sandbox_state":"applied","sandbox_accepted":null,"material":[]}}`
+	old := `{"kind":"start","version":1,"sequence":1,"at":"2026-09-24T10:07:00Z","boot":1,"pid":1,"config":{"mode":"server","listen":"a","target":"b","proxy_protocol":"off","status_listen":null,"status_client_cert":false,"session_tickets":false,"verify_on_resume":true,"acl":["allow-all"],"lifetime_cap_seconds":0,"sandbox_state":"applied","sandbox_accepted":null,"material":[],"binary":{"path":"/usr/local/bin/ghostunnel","sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}}`
 	if _, err := DecodeLine([]byte(old)); err == nil {
 		t.Fatal("a start line without the admin-surface fields must be malformed")
 	}
-	line := `{"kind":"start","version":1,"sequence":1,"at":"2026-09-24T10:07:00Z","boot":1,"pid":1,"config":{"mode":"server","listen":"a","target":"b","proxy_protocol":"off","status_listen":null,"status_client_cert":false,"pprof_cmdline_redacted":true,"shutdown_requires_client_cert":true,"session_tickets":false,"verify_on_resume":true,"acl":["allow-all"],"lifetime_cap_seconds":0,"sandbox_state":"applied","sandbox_accepted":null,"material":[]}}`
+	line := `{"kind":"start","version":1,"sequence":1,"at":"2026-09-24T10:07:00Z","boot":1,"pid":1,"config":{"mode":"server","listen":"a","target":"b","proxy_protocol":"off","status_listen":null,"status_client_cert":false,"pprof_cmdline_redacted":true,"shutdown_requires_client_cert":true,"session_tickets":false,"verify_on_resume":true,"acl":["allow-all"],"lifetime_cap_seconds":0,"sandbox_state":"applied","sandbox_accepted":null,"material":[],"binary":{"path":"/usr/local/bin/ghostunnel","sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}}`
 	rec, err := DecodeLine([]byte(line))
 	if err != nil {
 		t.Fatalf("decode: %v", err)
@@ -346,7 +350,7 @@ func TestConfigCarriesProxyProtocol(t *testing.T) {
 		t.Fatalf("ConfigKeys = %v, want proxy_protocol after target", ConfigKeys)
 	}
 	line := func(pp string) string {
-		return `{"kind":"start","version":1,"sequence":1,"at":"2026-09-24T10:07:00Z","boot":1,"pid":1,"config":{"mode":"server","listen":"a","target":"b",` + pp + `"status_listen":null,"status_client_cert":false,"pprof_cmdline_redacted":true,"shutdown_requires_client_cert":true,"session_tickets":false,"verify_on_resume":true,"acl":["allow-all"],"lifetime_cap_seconds":0,"sandbox_state":"applied","sandbox_accepted":null,"material":[]}}`
+		return `{"kind":"start","version":1,"sequence":1,"at":"2026-09-24T10:07:00Z","boot":1,"pid":1,"config":{"mode":"server","listen":"a","target":"b",` + pp + `"status_listen":null,"status_client_cert":false,"pprof_cmdline_redacted":true,"shutdown_requires_client_cert":true,"session_tickets":false,"verify_on_resume":true,"acl":["allow-all"],"lifetime_cap_seconds":0,"sandbox_state":"applied","sandbox_accepted":null,"material":[],"binary":{"path":"/usr/local/bin/ghostunnel","sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}}`
 	}
 	if _, err := DecodeLine([]byte(line(``))); err == nil {
 		t.Fatal("a start line without proxy_protocol must be malformed")
@@ -370,7 +374,7 @@ func TestConfigCarriesProxyProtocol(t *testing.T) {
 	at := time.Date(2026, 9, 24, 10, 7, 0, 0, time.UTC)
 	for _, pp := range []string{"", "v2", "TLS"} {
 		rec := Record{Sequence: 1, At: at, Body: &Start{Boot: 1, PID: 1, Config: Config{
-			Mode: "server", Listen: "a", Target: "b", ProxyProtocol: pp, ACL: []string{"allow-all"}, SandboxState: SandboxApplied, Material: []Material{},
+			Mode: "server", Listen: "a", Target: "b", ProxyProtocol: pp, ACL: []string{"allow-all"}, SandboxState: SandboxApplied, Material: []Material{}, Binary: testBinary,
 		}}}
 		if _, err := EncodeLine(rec); err == nil {
 			t.Errorf("proxy_protocol %q encoded", pp)
@@ -404,7 +408,7 @@ func TestConfigCarriesSandboxState(t *testing.T) {
 	at := time.Date(2026, 9, 24, 10, 7, 0, 0, time.UTC)
 	start := func(state string, accepted *string) Record {
 		return Record{Sequence: 1, At: at, Body: &Start{Boot: 1, PID: 1, Config: Config{
-			Mode: "server", Listen: "a", Target: "b", ProxyProtocol: ProxyProtocolOff, ACL: []string{"allow-all"}, SandboxState: state, SandboxAccepted: accepted, Material: []Material{},
+			Mode: "server", Listen: "a", Target: "b", ProxyProtocol: ProxyProtocolOff, ACL: []string{"allow-all"}, SandboxState: state, SandboxAccepted: accepted, Material: []Material{}, Binary: testBinary,
 		}}}
 	}
 	windows := "windows"
@@ -451,22 +455,22 @@ func TestConfigCarriesSandboxState(t *testing.T) {
 	}
 	prefix := `{"kind":"start","version":1,"sequence":1,"at":"2026-09-24T10:07:00Z","boot":1,"pid":1,"config":{"mode":"server","listen":"a","target":"b","proxy_protocol":"off","status_listen":null,"status_client_cert":false,"pprof_cmdline_redacted":true,"shutdown_requires_client_cert":true,"session_tickets":false,"verify_on_resume":true,"acl":["allow-all"],"lifetime_cap_seconds":0,`
 	for name, tail := range map[string]string{
-		"landlock key":        `"landlock":false,"material":[]}}`,
-		"landlock and state":  `"landlock":false,"sandbox_state":"applied","sandbox_accepted":null,"material":[]}}`,
-		"state missing":       `"sandbox_accepted":null,"material":[]}}`,
-		"acceptance missing":  `"sandbox_state":"applied","material":[]}}`,
-		"state outside":       `"sandbox_state":"on","sandbox_accepted":null,"material":[]}}`,
-		"state null":          `"sandbox_state":null,"sandbox_accepted":null,"material":[]}}`,
-		"state boolean":       `"sandbox_state":true,"sandbox_accepted":null,"material":[]}}`,
-		"acceptance empty":    `"sandbox_state":"unsupported","sandbox_accepted":"","material":[]}}`,
-		"acceptance boolean":  `"sandbox_state":"unsupported","sandbox_accepted":true,"material":[]}}`,
-		"acceptance with pem": `"sandbox_state":"unsupported","sandbox_accepted":"-----BEGIN X-----","material":[]}}`,
+		"landlock key":        `"landlock":false,"material":[],"binary":{"path":"/usr/local/bin/ghostunnel","sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}}`,
+		"landlock and state":  `"landlock":false,"sandbox_state":"applied","sandbox_accepted":null,"material":[],"binary":{"path":"/usr/local/bin/ghostunnel","sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}}`,
+		"state missing":       `"sandbox_accepted":null,"material":[],"binary":{"path":"/usr/local/bin/ghostunnel","sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}}`,
+		"acceptance missing":  `"sandbox_state":"applied","material":[],"binary":{"path":"/usr/local/bin/ghostunnel","sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}}`,
+		"state outside":       `"sandbox_state":"on","sandbox_accepted":null,"material":[],"binary":{"path":"/usr/local/bin/ghostunnel","sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}}`,
+		"state null":          `"sandbox_state":null,"sandbox_accepted":null,"material":[],"binary":{"path":"/usr/local/bin/ghostunnel","sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}}`,
+		"state boolean":       `"sandbox_state":true,"sandbox_accepted":null,"material":[],"binary":{"path":"/usr/local/bin/ghostunnel","sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}}`,
+		"acceptance empty":    `"sandbox_state":"unsupported","sandbox_accepted":"","material":[],"binary":{"path":"/usr/local/bin/ghostunnel","sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}}`,
+		"acceptance boolean":  `"sandbox_state":"unsupported","sandbox_accepted":true,"material":[],"binary":{"path":"/usr/local/bin/ghostunnel","sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}}`,
+		"acceptance with pem": `"sandbox_state":"unsupported","sandbox_accepted":"-----BEGIN X-----","material":[],"binary":{"path":"/usr/local/bin/ghostunnel","sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}}`,
 	} {
 		if _, err := DecodeLine([]byte(prefix + tail)); err == nil {
 			t.Errorf("%s: decoded but must be rejected", name)
 		}
 	}
-	if _, err := DecodeLine([]byte(prefix + `"sandbox_state":"unsupported","sandbox_accepted":"windows","material":[]}}`)); err != nil {
+	if _, err := DecodeLine([]byte(prefix + `"sandbox_state":"unsupported","sandbox_accepted":"windows","material":[],"binary":{"path":"/usr/local/bin/ghostunnel","sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}}`)); err != nil {
 		t.Fatalf("control line must decode: %v", err)
 	}
 }
@@ -492,7 +496,7 @@ func TestConfigCarriesACL(t *testing.T) {
 	at := time.Date(2026, 9, 24, 10, 7, 0, 0, time.UTC)
 	start := func(acl []string) Record {
 		return Record{Sequence: 1, At: at, Body: &Start{Boot: 1, PID: 1, Config: Config{
-			Mode: "server", Listen: "a", Target: "b", ProxyProtocol: ProxyProtocolOff, ACL: acl, SandboxState: SandboxApplied, Material: []Material{},
+			Mode: "server", Listen: "a", Target: "b", ProxyProtocol: ProxyProtocolOff, ACL: acl, SandboxState: SandboxApplied, Material: []Material{}, Binary: testBinary,
 		}}}
 	}
 	hash := "c" + strings.Repeat("2", 63)
@@ -551,7 +555,7 @@ func TestConfigCarriesACL(t *testing.T) {
 		}
 	}
 	prefix := `{"kind":"start","version":1,"sequence":1,"at":"2026-09-24T10:07:00Z","boot":1,"pid":1,"config":{"mode":"server","listen":"a","target":"b","proxy_protocol":"off","status_listen":null,"status_client_cert":false,"pprof_cmdline_redacted":true,"shutdown_requires_client_cert":true,"session_tickets":false,"verify_on_resume":true,`
-	suffix := `"lifetime_cap_seconds":0,"sandbox_state":"applied","sandbox_accepted":null,"material":[]}}`
+	suffix := `"lifetime_cap_seconds":0,"sandbox_state":"applied","sandbox_accepted":null,"material":[],"binary":{"path":"/usr/local/bin/ghostunnel","sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}}`
 	for name, acl := range map[string]string{
 		"missing":     ``,
 		"null":        `"acl":null,`,
@@ -702,6 +706,60 @@ func TestRefusalLine(t *testing.T) {
 	} {
 		if _, err := DecodeLine([]byte(bad)); err == nil {
 			t.Errorf("%s: decoded but must be rejected", name)
+		}
+	}
+}
+
+// TestConfigCarriesBinary: config.binary is required, after material, and
+// holds exactly a non-empty path and a lower-case SHA-256 hex string. A
+// start line without it is malformed, as one without proxy_protocol is.
+func TestConfigCarriesBinary(t *testing.T) {
+	if ConfigKeys[len(ConfigKeys)-1] != "binary" || strings.Join(BinaryKeys, ",") != "path,sha256" {
+		t.Fatalf("ConfigKeys = %v, BinaryKeys = %v", ConfigKeys, BinaryKeys)
+	}
+	hash := strings.Repeat("b", 64)
+	line := func(binary string) string {
+		return `{"kind":"start","version":1,"sequence":1,"at":"2026-09-24T10:07:00Z","boot":1,"pid":1,"config":{"mode":"server","listen":"a","target":"b","proxy_protocol":"off","status_listen":null,"status_client_cert":false,"pprof_cmdline_redacted":true,"shutdown_requires_client_cert":true,"session_tickets":false,"verify_on_resume":true,"acl":["allow-all"],"lifetime_cap_seconds":0,"sandbox_state":"applied","sandbox_accepted":null,"material":[]` + binary + `}}`
+	}
+	rec, err := DecodeLine([]byte(line(`,"binary":{"path":"/usr/local/bin/ghostunnel","sha256":"` + hash + `"}`)))
+	if err != nil {
+		t.Fatalf("control line: %v", err)
+	}
+	if got := rec.Body.(*Start).Config.Binary; got != (Binary{Path: "/usr/local/bin/ghostunnel", SHA256: hash}) {
+		t.Fatalf("binary = %+v", got)
+	}
+	for name, binary := range map[string]string{
+		"missing":       ``,
+		"null":          `,"binary":null`,
+		"string":        `,"binary":"/usr/local/bin/ghostunnel"`,
+		"no path":       `,"binary":{"sha256":"` + hash + `"}`,
+		"no hash":       `,"binary":{"path":"/usr/local/bin/ghostunnel"}`,
+		"extra key":     `,"binary":{"path":"/usr/local/bin/ghostunnel","sha256":"` + hash + `","size":1}`,
+		"empty path":    `,"binary":{"path":"","sha256":"` + hash + `"}`,
+		"null path":     `,"binary":{"path":null,"sha256":"` + hash + `"}`,
+		"null hash":     `,"binary":{"path":"/usr/local/bin/ghostunnel","sha256":null}`,
+		"short hash":    `,"binary":{"path":"/usr/local/bin/ghostunnel","sha256":"` + hash[:63] + `"}`,
+		"upper hash":    `,"binary":{"path":"/usr/local/bin/ghostunnel","sha256":"` + strings.ToUpper(hash) + `"}`,
+		"pem in path":   `,"binary":{"path":"-----BEGIN CERTIFICATE-----","sha256":"` + hash + `"}`,
+		"duplicate key": `,"binary":{"path":"/a","path":"/b","sha256":"` + hash + `"}`,
+	} {
+		if _, err := DecodeLine([]byte(line(binary))); err == nil {
+			t.Errorf("%s: decoded but must be rejected", name)
+		}
+	}
+	at := time.Date(2026, 9, 24, 10, 7, 0, 0, time.UTC)
+	for name, b := range map[string]Binary{
+		"zero":        {},
+		"empty path":  {SHA256: hash},
+		"no hash":     {Path: "/usr/local/bin/ghostunnel"},
+		"upper hash":  {Path: "/usr/local/bin/ghostunnel", SHA256: strings.ToUpper(hash)},
+		"pem in path": {Path: "-----BEGIN CERTIFICATE-----", SHA256: hash},
+	} {
+		rec := Record{Sequence: 1, At: at, Body: &Start{Boot: 1, PID: 1, Config: Config{
+			Mode: "server", Listen: "a", Target: "b", ProxyProtocol: ProxyProtocolOff, ACL: []string{"allow-all"}, SandboxState: SandboxApplied, Material: []Material{}, Binary: b,
+		}}}
+		if _, err := EncodeLine(rec); err == nil {
+			t.Errorf("%s: encoded but must be refused", name)
 		}
 	}
 }

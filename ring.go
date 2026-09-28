@@ -33,9 +33,11 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"net"
 	"os"
+	"path/filepath"
 	"runtime"
 	"slices"
 	"sort"
@@ -380,7 +382,77 @@ func ringConfig(mode, listen, target string, proxyProtocol proxy.ProxyProtocolMo
 	if err != nil {
 		return cfg, nil, err
 	}
+	if cfg.Binary, err = recordRingBinary(); err != nil {
+		return cfg, nil, err
+	}
 	return cfg, ca, nil
+}
+
+// ringExecutable names the executable this process started from (a seam
+// for tests).
+var ringExecutable = os.Executable
+
+// ringExecutableImage names the file ringBinary hashes for the resolved
+// path. On Linux it is /proc/self/exe, the very file this process was
+// executed from, even when the path has been replaced since the exec;
+// elsewhere it is the path (a seam for tests).
+var ringExecutableImage = func(path string) string {
+	if runtime.GOOS == "linux" {
+		return "/proc/self/exe"
+	}
+	return path
+}
+
+// ringBinaryRecord is ringBinary's result, taken once per process.
+type ringBinaryRecord struct {
+	once   sync.Once
+	taken  bool
+	binary ringtrace.Binary
+	err    error
+}
+
+// ringStartBinary is this process's record (replaced by tests).
+var ringStartBinary = &ringBinaryRecord{}
+
+// recordRingBinary takes the record of the executable once per process and
+// returns it. run calls it before the process sandbox is applied, since
+// landlock grants no read of the executable; ringConfig then reads the
+// record taken there.
+func recordRingBinary() (ringtrace.Binary, error) {
+	r := ringStartBinary
+	r.once.Do(func() {
+		r.binary, r.err = ringBinary()
+		r.taken = true
+	})
+	return r.binary, r.err
+}
+
+// ringBinary is the start line's record of the executable this process
+// started from: its path with every symbolic link resolved, and the
+// SHA-256 of the executed file's bytes. The material observer holds the
+// file at that path to this hash every cycle, and this hash to the
+// operator's expectation (binary-expected). A path that cannot be
+// resolved or a file that cannot be read is an error, and the process
+// refuses to start on it.
+func ringBinary() (ringtrace.Binary, error) {
+	exe, err := ringExecutable()
+	if err != nil {
+		return ringtrace.Binary{}, fmt.Errorf("ring: executable: %w", err)
+	}
+	path, err := filepath.EvalSymlinks(exe)
+	if err != nil {
+		return ringtrace.Binary{}, fmt.Errorf("ring: executable: %w", err)
+	}
+	f, err := os.Open(ringExecutableImage(path))
+	if err != nil {
+		return ringtrace.Binary{}, fmt.Errorf("ring: executable: %w", err)
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return ringtrace.Binary{}, fmt.Errorf("ring: executable %s: %w", path, err)
+	}
+	return ringtrace.Binary{Path: path, SHA256: hex.EncodeToString(h.Sum(nil))}, nil
 }
 
 // lifetimeCapSeconds is --max-conn-lifetime in whole seconds, rounded up so

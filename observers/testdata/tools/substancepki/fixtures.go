@@ -423,8 +423,13 @@ func fixtureStart(p *pkiFiles, boot, pid int64, rules []string) *ringtrace.Start
 			{Material: "key", Path: "/etc/gt/key.pem"},
 			{Material: "ca", Path: "material/ca.pem", SHA256: ptr(p.caHash)},
 		},
+		Binary: fixtureBinary,
 	}}
 }
+
+// fixtureBinary is the executable every fixture's start line names. The
+// fixtures judge the trace-only rules, which never open it.
+var fixtureBinary = ringtrace.Binary{Path: "/usr/local/bin/ghostunnel", SHA256: strings.Repeat("b", 64)}
 
 // encodeBoot encodes records as one segment, each line by
 // ringtrace.EncodeLine, with the sequences 1, 2, 3, ... in order.
@@ -653,6 +658,7 @@ func writeFixture(p *pkiFiles, spec fixtureSpec, fixtures, baseDir string, base 
 		Mode: "server", Listen: "localhost:8443", Target: "localhost:8080", ProxyProtocol: ringtrace.ProxyProtocolOff, StatusListen: &status,
 		PprofCmdlineRedacted: true, ShutdownRequiresClientCert: true, SessionTickets: true, VerifyOnResume: true,
 		ACL: rules, LifetimeCapSeconds: 300, SandboxState: ringtrace.SandboxApplied, Material: material,
+		Binary: fixtureBinary,
 	}})
 	named := map[string]bool{}
 	// stored is every bundle a start or reload line hashes, by role; the

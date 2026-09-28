@@ -19,7 +19,10 @@
 #                string on all four); the tunnel unit reads
 #                observers.env and never ring.env, and passes
 #                -expect-listen/-expect-target/-expect-acl (each tested
-#                non-empty) and -expect-proxy-protocol= from it;
+#                non-empty) and -expect-proxy-protocol= from it; the
+#                material unit passes -expect-binary-sha256 from it (tested
+#                non-empty); each of those flags and every -policy-query=
+#                appears exactly once in its ExecStart;
 #                ghostunnel.service reads ring.env only and carries
 #                WatchdogSec=, which no member carries; no unit carries an
 #                -accept-no-* flag; ghostunnel.service carries UMask=0027
@@ -112,6 +115,20 @@ tree_row() { awk -F'\t' -v p="$1" '$1==p {print $2 "\t" $3 "\t" $4}' "$TREE"; }
 flag_value() { # exec_line flag
   local re; re=$(printf '%s' "$2" | sed 's/[][\\.*^$]/\\&/g')
   sed -n "s/.* $re \([^ ]*\).*/\1/p" <<<"$1"
+}
+# How many times a flag's name appears in an ExecStart line, in any
+# spelling (-f, --f, -f=v). Go's flag package keeps the last value of a
+# repeated flag, so a second occurrence would override the first.
+flag_count() { # exec_line flag
+  grep -o -- "$2" <<<"$1" | wc -l | tr -d ' '
+}
+# Fail unless each named flag appears exactly once in the ExecStart line.
+flags_once() { # unit exec_line flag...
+  local u=$1 line=$2 fl n; shift 2
+  for fl in "$@"; do
+    n=$(flag_count "$line" "$fl")
+    [[ $n == 1 ]] || fail "$u: ExecStart carries $fl $n times; exactly once, or the last one wins"
+  done
 }
 # The mapping every member judges the owner of its halts/ entries by (SPEC
 # 10.2 H7): member=account for each member, the account being the User= of
@@ -371,7 +388,8 @@ stage_static() {
         [[ $exec_line == *'-expect-acl ${GT_EXPECT_ACL}'* ]] || fail "$u: ExecStart lacks '-expect-acl \${GT_EXPECT_ACL}'"
         [[ $exec_line == *'-expect-proxy-protocol=${GT_EXPECT_PROXY_PROTOCOL}'* ]] || fail "$u: ExecStart lacks '-expect-proxy-protocol=\${GT_EXPECT_PROXY_PROTOCOL}'"
         [[ $exec_line == *'-policy-query=${GT_EXPECT_POLICY_QUERY}'* ]] || fail "$u: ExecStart lacks '-policy-query=\${GT_EXPECT_POLICY_QUERY}'"
-        pass "$u: expectations from observers.env only (-expect-listen, -expect-target, -expect-acl, each tested non-empty; -expect-proxy-protocol= and -policy-query= may be empty; ring.env unnamed)"
+        flags_once "$u" "$exec_line" -expect-listen -expect-target -expect-acl -expect-proxy-protocol -policy-query
+        pass "$u: expectations from observers.env only, each flag once (-expect-listen, -expect-target, -expect-acl, each tested non-empty; -expect-proxy-protocol= and -policy-query= may be empty; ring.env unnamed)"
         ;;
       *)
         # Every member re-judges the tunnel surface, so the policy query
@@ -380,7 +398,17 @@ stage_static() {
         [[ $envs == /etc/ghostunnel/observers.env ]] || fail "$u: EnvironmentFile= must be exactly /etc/ghostunnel/observers.env (for GT_EXPECT_POLICY_QUERY)"
         grep -q 'ring\.env' "$f" && fail "$u: names ring.env; an observer's expectation must not come from the proxy's own configuration" || true
         [[ $exec_line == *'-policy-query=${GT_EXPECT_POLICY_QUERY}'* ]] || fail "$u: ExecStart lacks '-policy-query=\${GT_EXPECT_POLICY_QUERY}'"
-        pass "$u: -policy-query= from observers.env, the same variable as tunnel's; ring.env unnamed"
+        flags_once "$u" "$exec_line" -policy-query
+        pass "$u: -policy-query= from observers.env once, the same variable as tunnel's; ring.env unnamed"
+        # The material observer's binary-expected: the checksum the
+        # operator expects of the proxy's executable, from observers.env,
+        # tested non-empty before the start.
+        if [[ $user == gtobs-material ]]; then
+          grep -qx 'ExecStartPre=/usr/bin/test -n "${GT_EXPECT_BINARY_SHA256}"' <(unit_lines "$f") || fail "$u: no ExecStartPre test -n for \${GT_EXPECT_BINARY_SHA256}"
+          [[ $exec_line == *'-expect-binary-sha256 ${GT_EXPECT_BINARY_SHA256}'* ]] || fail "$u: ExecStart lacks '-expect-binary-sha256 \${GT_EXPECT_BINARY_SHA256}'"
+          flags_once "$u" "$exec_line" -expect-binary-sha256
+          pass "$u: -expect-binary-sha256 once, from observers.env, tested non-empty"
+        fi
         ;;
     esac
     if [[ $user != gt ]]; then
@@ -632,7 +660,11 @@ probe_forged_slot() { # m peer other
   [[ -e $slot ]] || return
   local creator; creator=$(stat -c %U "$slot" || echo unknown)
   [[ $creator == "$W" ]] && pass "$W: the kernel recorded $W, not gtobs-$other, as the owner of $peer/halts/$other" || fail "$W: $peer/halts/$other is owned by $creator, not $W"
-  expect_ok "$P" "the $peer member ran one cycle on the scratch tree from $bin" "$bin" -identity "$peer" -members "$members" -coordinator super -copy-authors tunnel=material,admin=tunnel,material=admin -slot-owners "$so" -stores "$S" -traces "$S/gt" -tree "$stree" -cadence 10 -heartbeat-max-age 30s -cycles 1
+  # The material member refuses to start without an expected checksum;
+  # any well-formed one serves here, since the probe judges I8 alone.
+  local extra=()
+  [[ $peer == material ]] && extra=(-expect-binary-sha256 "$(printf '%064d' 0)")
+  expect_ok "$P" "the $peer member ran one cycle on the scratch tree from $bin" "$bin" -identity "$peer" -members "$members" -coordinator super -copy-authors tunnel=material,admin=tunnel,material=admin -slot-owners "$so" -stores "$S" -traces "$S/gt" -tree "$stree" -cadence 10 -heartbeat-max-age 30s -cycles 1 "${extra[@]}"
   local uid; uid=$(id -u "$W")
   local want="\"check\":\"I8\",\"subject\":\"$peer/halts/$other:owner:$uid\""
   if [[ -r $S/$peer/fault ]] && grep -qF "$want" "$S/$peer/fault"; then

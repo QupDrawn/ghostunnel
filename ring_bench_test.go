@@ -69,6 +69,7 @@ func benchRing(b *testing.B) *ring {
 		Mode: "server", Listen: "127.0.0.1:8443", Target: "127.0.0.1:8080", ProxyProtocol: ringtrace.ProxyProtocolOff,
 		ACL: []string{"disable-authentication"}, SandboxState: ringtrace.SandboxUnsupported,
 		Material: []ringtrace.Material{{Material: "cert", Path: "/etc/gt/server.crt"}, {Material: "key", Path: "/etc/gt/server.key"}},
+		Binary:   testRingBinary,
 	}
 	goos := "windows"
 	cfg.SandboxAccepted = &goos

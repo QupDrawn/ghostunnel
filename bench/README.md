@@ -205,10 +205,15 @@ warning is marked disk bound instead.
 
 The remote command is `cd <remote-bench> && go run . <flags>` with
 `/usr/local/go/bin` appended to the PATH, so a Go installed there or already
-on the PATH both work. The run stays in the foreground of the ssh session:
-closing the session kills it. A run that must outlive this machine is
-started on the remote host with `nohup` and collected afterwards with
-`-latest`.
+on the PATH both work. Every flag value is quoted as one word for the remote
+shell, spaces and quotes included, and a bare `~` or a leading `~/` still
+expands there. A remote path must be absolute, `~`, or start with `~/`;
+anything else is refused before ssh or scp runs. On Windows, Git Bash
+rewrites an argument such as `/var/lib/x` into a Windows path before the
+tool sees it, which that check catches; set `MSYS_NO_PATHCONV=1` for the
+command. The run stays in the foreground of the ssh session: closing the
+session kills it. A run that must outlive this machine is started on the
+remote host with `nohup` and collected afterwards with `-latest`.
 
 ## Preparing a remote host
 

@@ -1,6 +1,6 @@
 {
     "fixture": "trace-segment-pre-extended",
-    "description": "A pre-extended segment reads as its content. The proxy's live segment holds nine complete lines followed by 4096 NUL bytes of unwritten space; by the segment rule (SPEC 14) the content is the bytes before the first NUL, so the boot reads as nine records, not torn, with the prefix of complete lines 1894 bytes long, and two reads over the same file leave trace-consistent nothing to report. The stores and schedule traces are those of trace-fresh-complete; the cycle's verdict is that fixture's.",
+    "description": "A pre-extended segment reads as its content. The proxy's live segment holds nine complete lines followed by 4096 NUL bytes of unwritten space; by the segment rule (SPEC 14) the content is the bytes before the first NUL, so the boot reads as nine records, not torn, with the prefix of complete lines 2016 bytes long, and two reads over the same file leave trace-consistent nothing to report. The stores and schedule traces are those of trace-fresh-complete; the cycle's verdict is that fixture's.",
     "rules": [
         "SPEC 14",
         "SPEC 14.3"
@@ -86,7 +86,7 @@
             "records": 9,
             "torn": false,
             "segments": {
-                "0000000001.trace": 1894
+                "0000000001.trace": 2016
             }
         }
     }

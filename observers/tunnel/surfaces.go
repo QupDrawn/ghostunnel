@@ -7,10 +7,10 @@ package main
 // surface has a single judge only if nobody else looks; when everybody
 // looks, an owner that stops reporting what its own rules find, or stops
 // running them, is seen by the other three. The file and process checks
-// (material-loaded, key-private, sandbox-applied, cmdline-carries-no-secret,
-// proxy-process-alive) stay with their owner: they read the owner's host,
-// which the others cannot; so do the tunnel member's expectations
-// (listener-expected, target-expected, acl-expected,
+// (material-loaded, binary-expected, key-private, sandbox-applied,
+// cmdline-carries-no-secret, proxy-process-alive) stay with their owner:
+// they read the owner's host, which the others cannot; so do the tunnel
+// member's expectations (listener-expected, target-expected, acl-expected,
 // proxy-protocol-expected), which are its own configuration.
 //
 // The comparison is at the identifier: an identifier this member computes

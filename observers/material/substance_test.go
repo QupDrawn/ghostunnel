@@ -49,7 +49,7 @@ func subConfigMode(mode string, acl []string, material ...string) string {
 	for i, r := range acl {
 		quoted[i] = fmt.Sprintf("%q", r)
 	}
-	return fmt.Sprintf(`{"mode":%q,"listen":"localhost:8443","target":"localhost:8080","proxy_protocol":"off","status_listen":"127.0.0.1:6060","status_client_cert":false,"pprof_cmdline_redacted":true,"shutdown_requires_client_cert":true,"session_tickets":true,"verify_on_resume":true,"acl":[%s],"lifetime_cap_seconds":300,"sandbox_state":"applied","sandbox_accepted":null,"material":[%s]}`, mode, strings.Join(quoted, ","), strings.Join(material, ","))
+	return fmt.Sprintf(`{"mode":%q,"listen":"localhost:8443","target":"localhost:8080","proxy_protocol":"off","status_listen":"127.0.0.1:6060","status_client_cert":false,"pprof_cmdline_redacted":true,"shutdown_requires_client_cert":true,"session_tickets":true,"verify_on_resume":true,"acl":[%s],"lifetime_cap_seconds":300,"sandbox_state":"applied","sandbox_accepted":null,"material":[%s],"binary":{"path":"/usr/local/bin/ghostunnel","sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}`, mode, strings.Join(quoted, ","), strings.Join(material, ","))
 }
 
 func subHdr(kind string, at string) string {

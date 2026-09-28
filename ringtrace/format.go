@@ -105,6 +105,18 @@ type Config struct {
 	SandboxState    string     `json:"sandbox_state"`
 	SandboxAccepted *string    `json:"sandbox_accepted"`
 	Material        []Material `json:"material"`
+	// Binary is the proxy's own executable as this process started from
+	// it. Always present: a start line that does not say which file was
+	// executed cannot be held to the operator's expectation of it.
+	Binary Binary `json:"binary"`
+}
+
+// Binary is the executable a process started from: the path it was
+// executed from with every symbolic link resolved, and the lower-case hex
+// SHA-256 of the executed file's bytes, read once at startup.
+type Binary struct {
+	Path   string `json:"path"`
+	SHA256 string `json:"sha256"`
 }
 
 // The PROXY protocol v2 modes a start line reports: what the backend is
@@ -250,8 +262,9 @@ func (*Shutdown) Kind() Kind    { return KindShutdown }
 // Key sets, documented in README.md. headerKeys lead every line.
 var (
 	headerKeys   = []string{"kind", "version", "sequence", "at"}
-	ConfigKeys   = []string{"mode", "listen", "target", "proxy_protocol", "status_listen", "status_client_cert", "pprof_cmdline_redacted", "shutdown_requires_client_cert", "session_tickets", "verify_on_resume", "acl", "lifetime_cap_seconds", "sandbox_state", "sandbox_accepted", "material"}
+	ConfigKeys   = []string{"mode", "listen", "target", "proxy_protocol", "status_listen", "status_client_cert", "pprof_cmdline_redacted", "shutdown_requires_client_cert", "session_tickets", "verify_on_resume", "acl", "lifetime_cap_seconds", "sandbox_state", "sandbox_accepted", "material", "binary"}
 	MaterialKeys = []string{"material", "path", "sha256"}
+	BinaryKeys   = []string{"path", "sha256"}
 	PeerKeys     = []string{"subject", "issuer", "serial", "sans", "fingerprint"}
 
 	bodyKeys = map[Kind][]string{
@@ -492,7 +505,25 @@ func (s *Start) validate() error {
 			return err
 		}
 	}
-	return validateMaterials(c.Material, "config.material")
+	if err := validateMaterials(c.Material, "config.material"); err != nil {
+		return err
+	}
+	return validateBinary(c.Binary)
+}
+
+// validateBinary holds config.binary to its shape: a path that is not
+// empty and carries no PEM, and a lower-case SHA-256 hex string.
+func validateBinary(b Binary) error {
+	if err := nonEmpty(b.Path, "config.binary.path"); err != nil {
+		return err
+	}
+	if err := noPEM(b.Path, "config.binary.path"); err != nil {
+		return err
+	}
+	if !reHash.MatchString(b.SHA256) {
+		return errors.New("config.binary.sha256: not a lower-case SHA-256 hex string")
+	}
+	return nil
 }
 
 func (a *Accept) validate() error {
@@ -806,7 +837,11 @@ func appendConfig(out []byte, c *Config) []byte {
 	out = appendStringPtr(out, c.SandboxAccepted)
 	out = append(out, `,"material":`...)
 	out = appendMaterials(out, c.Material)
-	return append(out, '}')
+	out = append(out, `,"binary":{"path":`...)
+	out = appendString(out, c.Binary.Path)
+	out = append(out, `,"sha256":`...)
+	out = appendString(out, c.Binary.SHA256)
+	return append(out, '}', '}')
 }
 
 // appendMaterials appends a material list: null when nil, else an array of
@@ -1102,6 +1137,16 @@ func decodeStart(obj *rawObject) (Body, error) {
 		return nil, err
 	}
 	if cfg.Material, err = decodeMaterials(c.get("material"), "config.material"); err != nil {
+		return nil, err
+	}
+	b, err := decodeSubobject(c.get("binary"), BinaryKeys)
+	if err != nil {
+		return nil, fmt.Errorf("config.binary: %v", err)
+	}
+	if cfg.Binary.Path, err = stringField(b.get("path"), "config.binary.path"); err != nil {
+		return nil, err
+	}
+	if cfg.Binary.SHA256, err = stringField(b.get("sha256"), "config.binary.sha256"); err != nil {
 		return nil, err
 	}
 	return s, nil

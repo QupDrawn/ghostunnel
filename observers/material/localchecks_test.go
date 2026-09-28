@@ -131,13 +131,19 @@ func (f *mFiles) entries() string {
 }
 
 // mConfig is a start line's config; sandbox is the sandbox_state and
-// accepted the sandbox_accepted, "" standing for null.
+// accepted the sandbox_accepted, "" standing for null. The binary is the
+// stand-in executable at mBinaryPath with its hash (binaryexpected_test.go).
 func mConfig(material string, tickets, verifyOnResume bool, sandbox, accepted string) string {
+	return mConfigBinary(material, tickets, verifyOnResume, sandbox, accepted, mBinaryEntry(mBinaryPath, mBinarySHA))
+}
+
+// mConfigBinary is mConfig with the config.binary object given.
+func mConfigBinary(material string, tickets, verifyOnResume bool, sandbox, accepted, binary string) string {
 	acc := "null"
 	if accepted != "" {
 		acc = jstr(accepted)
 	}
-	return fmt.Sprintf(`{"mode":"server","listen":"localhost:8443","target":"localhost:8080","proxy_protocol":"off","status_listen":null,"status_client_cert":false,"pprof_cmdline_redacted":true,"shutdown_requires_client_cert":true,"session_tickets":%t,"verify_on_resume":%t,"acl":["allow-cn:client.example"],"lifetime_cap_seconds":0,"sandbox_state":%s,"sandbox_accepted":%s,"material":%s}`, tickets, verifyOnResume, jstr(sandbox), acc, material)
+	return fmt.Sprintf(`{"mode":"server","listen":"localhost:8443","target":"localhost:8080","proxy_protocol":"off","status_listen":null,"status_client_cert":false,"pprof_cmdline_redacted":true,"shutdown_requires_client_cert":true,"session_tickets":%t,"verify_on_resume":%t,"acl":["allow-cn:client.example"],"lifetime_cap_seconds":0,"sandbox_state":%s,"sandbox_accepted":%s,"material":%s,"binary":%s}`, tickets, verifyOnResume, jstr(sandbox), acc, material, binary)
 }
 
 func mHdr(kind string, seq int, at string) string {
@@ -226,7 +232,7 @@ func materialWant(t *testing.T, got []Finding, want ...Finding) {
 }
 
 func TestMaterialIdentifiers(t *testing.T) {
-	want := []string{"trace-readable", "material-loaded", "key-private", "reload-succeeded", "sandbox-applied", "resumption-bound", "tick-fresh", "trace-consistent", "boot-ambiguous", "boot-ended"}
+	want := []string{"trace-readable", "material-loaded", "binary-expected", "key-private", "reload-succeeded", "sandbox-applied", "resumption-bound", "tick-fresh", "trace-consistent", "boot-ambiguous", "boot-ended"}
 	if got := (MaterialChecks{}).Identifiers(); fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Fatalf("identifiers %v, want %v", got, want)
 	}
@@ -377,6 +383,11 @@ func materialRunWith(t *testing.T, root string, checks MaterialChecks) []Finding
 		// pid 4242, which may or may not be a process on this host.
 		checks.Live = procLiveness(blTable(t, 4242))
 	}
+	if checks.ExpectBinarySHA256 == "" {
+		// The stand-in executable every mConfig start line names, and
+		// the hash it records (binaryexpected_test.go).
+		checks.ExpectBinarySHA256 = mBinarySHA
+	}
 	if checks.KeyProbe == nil {
 		// The key files here are the test's own, on whatever host runs
 		// it: key-private sees them as root's, 0600, asked by a member
@@ -488,7 +499,7 @@ func TestMaterialAcceptNoSandboxFlag(t *testing.T) {
 	}
 	// Through parseFlags on this host: the value must be this OS, and on
 	// linux no value is accepted.
-	base := []string{"-heartbeat-max-age", "30s", "-slot-owners", "tunnel=a,admin=b,material=c,super=d"}
+	base := []string{"-heartbeat-max-age", "30s", "-slot-owners", "tunnel=a,admin=b,material=c,super=d", "-expect-binary-sha256", strings.Repeat("a", 64)}
 	cfg, _, _, err := parseFlags(base)
 	if err != nil {
 		t.Fatalf("defaults: %v", err)
@@ -574,7 +585,7 @@ func TestMaterialRunJudgesTheRing(t *testing.T) {
 	run := func(root string, checks MaterialChecks, st *State, peers map[string]PeerView) []Finding {
 		return materialSorted(checks.Run(&Config{TracesRoot: root, Now: mNow(t)}, st, peers))
 	}
-	checks := MaterialChecks{Live: procLiveness(blTable(t, 4242)), KeyProbe: mRootKeyProbe}
+	checks := MaterialChecks{Live: procLiveness(blTable(t, 4242)), KeyProbe: mRootKeyProbe, ExpectBinarySHA256: mBinarySHA}
 	peers := map[string]PeerView{}
 	for _, o := range []string{"tunnel", "admin"} {
 		peers[o] = PeerView{Verdict: VerdictAlive, Checks: surfaceIdentifiers(o)}
@@ -595,7 +606,7 @@ func TestMaterialRunJudgesTheRing(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	materialWant(t, run(root, MaterialChecks{Live: procLiveness(table), KeyProbe: mRootKeyProbe}, &State{}, peers), Finding{"boot-ambiguous", "0000000001,0000000002"})
+	materialWant(t, run(root, MaterialChecks{Live: procLiveness(table), KeyProbe: mRootKeyProbe, ExpectBinarySHA256: mBinarySHA}, &State{}, peers), Finding{"boot-ambiguous", "0000000001,0000000002"})
 	// The current boot rewritten under this member between two cycles.
 	root = materialTree(t, materialHealthy(f)...)
 	st := &State{}

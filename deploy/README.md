@@ -15,7 +15,7 @@ What is in this directory:
 | `setup-tree.sh` | run once as root: users, groups, the tree; with `--pem DIR`, the PEM material too, installed with the owners and modes below. Idempotent. `--dry-run` prints instead |
 | `systemd/` | `ghostunnel-ring.target`, `ghostunnel.service`, `ghostunnel-obs-{tunnel,admin,material,super}.service` |
 | `ring.env.example` | the operator's own values for `ghostunnel.service` (`--listen`, `--target`, PEM paths, loopback `--status`, ACL); read by `gt` alone |
-| `observers.env.example` | the operator's EXPECTED listener, backend target, ACL and PROXY protocol mode for the tunnel observer, and the expected OPA query (`GT_EXPECT_POLICY_QUERY`, for `acl-substance`) read by all four observers; never derived from `ring.env` ("Two files, two sources") |
+| `observers.env.example` | what the operator expects: the listener, backend target, ACL and PROXY protocol mode for the tunnel observer, the SHA-256 of the ghostunnel executable for the material observer (`GT_EXPECT_BINARY_SHA256`, for `binary-expected`), and the OPA query (`GT_EXPECT_POLICY_QUERY`, for `acl-substance`) read by all four observers; never derived from `ring.env` ("Two files, two sources") |
 | `check-units.sh` | `--static` anywhere; `--verify`, `--tree`, `--probe`, `--namespace` on the host |
 
 ## Landlock and the ring
@@ -440,15 +440,23 @@ two stores are not retired with it.
 
 ## Install
 
-On the Linux host, as root, in this order.
+In this order. The build in step 1 runs where builds are produced and
+reviewed; every other step runs on the Linux host, as root.
 
-1. Build the five binaries from this repository and install them where the
-   units expect them:
+1. Build the five binaries from this repository for the host's OS and
+   architecture, and take the proxy's checksum from the build output
+   before anything is copied to the host:
    ```
-   go build -o /usr/local/bin/ghostunnel .
+   go build -o out/ghostunnel .
    for m in tunnel admin material super; do
-     go build -o /usr/local/bin/ghostunnel-obs-$m ./observers/$m
+     go build -o out/ghostunnel-obs-$m ./observers/$m
    done
+   sha256sum out/ghostunnel     # GT_EXPECT_BINARY_SHA256, step 5
+   ```
+   Copy `out/` to the host and install the binaries where the units expect
+   them:
+   ```
+   install -m 0755 -o root -g root out/ghostunnel out/ghostunnel-obs-* /usr/local/bin/
    ```
    (`ExecStart=` names `/usr/local/bin/...`; change the units if you install
    elsewhere.)
@@ -493,9 +501,22 @@ On the Linux host, as root, in this order.
 5. `cp observers.env.example /etc/ghostunnel/observers.env`, fill in
    `GT_EXPECT_LISTEN`, `GT_EXPECT_TARGET`, `GT_EXPECT_ACL` and
    `GT_EXPECT_PROXY_PROTOCOL` **from the record of what the
-   deployment is meant to be, not from `ring.env`**, then `chown root:root
-   /etc/ghostunnel/observers.env; chmod 0644`. Only the tunnel unit (as
-   `gtobs-tunnel`) reads it. See "Two files, two sources".
+   deployment is meant to be, not from `ring.env`**, and
+   `GT_EXPECT_BINARY_SHA256` from the checksum step 1 took where the
+   build is reviewed, **not from the file on this host**. The SPDX
+   document of that build output gives the same value; generate and read
+   it there, before the copy:
+   ```
+   go tool mage sbom:generate out/ghostunnel
+   jq -r '.files[0].checksums[] | select(.algorithm=="SHA256") | .checksumValue' out/ghostunnel.spdx.json
+   ```
+   `sbom:generate` writes its documents beside the binary it is given
+   (`docs/security/sbom.md`), so pointed at `/usr/local/bin/ghostunnel`
+   it would leave them in `/usr/local/bin`. Upstream's release SBOMs
+   cover upstream's binaries only; those carry no ring, are not this
+   proxy, and their checksum never matches it. Then `chown root:root
+   /etc/ghostunnel/observers.env; chmod 0644`. The four observer units
+   read it; `ghostunnel.service` does not. See "Two files, two sources".
 6. Units: `cp systemd/* /etc/systemd/system/ && systemctl daemon-reload`.
 7. Verify before starting: `./check-units.sh --all` (see "What was not
    verified here"). The probe stages need the ring stopped; it is.
@@ -519,6 +540,7 @@ holding:
 | `GT_EXPECT_TARGET` | the backend it is expected to dial | its `--target` value verbatim; compared exactly, so two spellings of one address are two targets |
 | `GT_EXPECT_ACL` | the access-control rules it is expected to run with | comma-separated, no spaces, as the start line carries them: `allow-cn:alice,allow-all`; vocabulary `allow-all`, `allow-cn:<v>`, `allow-ou:<v>`, `allow-dns:<v>`, `allow-uri:<v>`, `allow-ip:<v>`, `allow-spki-pin:<hex>`, `policy:<sha256>` |
 | `GT_EXPECT_PROXY_PROTOCOL` | what the backend is expected to be handed ahead of each connection's bytes | the start line's `proxy_protocol`: `off` (no header), `conn` (a PROXY protocol v2 header with the addresses), `tls` (with the TLS version, ALPN and SNI too), `tls-full` (with the client's whole certificate as well); empty means `off`, and there is no way to expect nothing |
+| `GT_EXPECT_BINARY_SHA256` | the build the proxy is expected to run | the SHA-256 of the ghostunnel executable, 64 lower-case hex characters, taken where the build is produced and reviewed, before the binary is copied to the host: `sha256sum` of the build output there, or the SHA-256 in the SPDX document `go tool mage sbom:generate <build output>` writes beside that output (`jq -r '.files[0].checksums[] \| select(.algorithm=="SHA256") \| .checksumValue' <build output>.spdx.json`); upstream's release SBOMs cover upstream's binaries only, which carry no ring and are not this proxy |
 
 The tunnel unit reads `observers.env` and passes `-expect-listen
 ${GT_EXPECT_LISTEN} -expect-target ${GT_EXPECT_TARGET} -expect-acl
@@ -526,9 +548,15 @@ ${GT_EXPECT_ACL}`, with an `ExecStartPre` `test -n` on each so an empty
 value fails the start rather than shifting the next flag into its place,
 and `-expect-proxy-protocol=${GT_EXPECT_PROXY_PROTOCOL}`, joined with `=`
 so that an empty value reaches the member as an empty value, which it
-reads as `off`. `ghostunnel.service` reads `ring.env` and never
-`observers.env`; the other three observers read it for
-`GT_EXPECT_POLICY_QUERY` alone. Both files are `root:root 0644` and hold
+reads as `off`. The material unit reads `observers.env` and passes
+`-expect-binary-sha256 ${GT_EXPECT_BINARY_SHA256}`, with an `ExecStartPre`
+`test -n` on it; the member refuses any value that is not 64 lower-case
+hex characters. `binary-expected` then fails unless the start line
+records exactly that hash for the executable and the file at the recorded
+path still hashes to it; the file is hashed in full every cycle.
+`ghostunnel.service` reads `ring.env` and never `observers.env`; admin and
+super read it for `GT_EXPECT_POLICY_QUERY` alone, and material for that
+and `GT_EXPECT_BINARY_SHA256`. Both files are `root:root 0644` and hold
 no secret; they are separate because they must come from different places
 and be reviewed by different eyes: write `ring.env` from what the host
 needs, write `observers.env` from the change record or inventory that
@@ -539,14 +567,25 @@ change to `ring.env` alone halts the ring, which is the property being
 bought. The PROXY protocol mode is here because it changes what the
 backend receives: under `tls-full` every connection carries the client's
 certificate to it, and a backend that was not written to expect that
-should not be sent it because a flag was added to `ring.env`.
+should not be sent it because a flag was added to `ring.env`. The binary
+checksum comes from the build output where the build is reviewed, before
+the copy, and never from the host; upstream's release SBOMs describe
+binaries without the ring and never match. An upgrade of
+`/usr/local/bin/ghostunnel` is two edits as well: the file and this line,
+then a restart of `ghostunnel.service` and of the material unit, which
+reads the line at start. Until both restart, the ring halts on
+`binary-expected`.
 
 `check-units.sh --static` enforces the split: the tunnel unit's
-`EnvironmentFile=` is exactly `observers.env`, its `ExecStart` carries both
-`-expect-*` flags from those variables with both `ExecStartPre` tests, and
-the string `ring.env` appears nowhere in the file, comments included;
+`EnvironmentFile=` is exactly `observers.env`, its `ExecStart` carries each
+of the four `-expect-*` flags from those variables exactly once, with the
+three `ExecStartPre` tests, and the string `ring.env` appears nowhere in
+the file, comments included; the material unit's `ExecStart` carries
+`-expect-binary-sha256 ${GT_EXPECT_BINARY_SHA256}` exactly once, with its
+`ExecStartPre` test;
 `ghostunnel.service` reads exactly `ring.env` and does not name
-`observers.env`; admin, material and super read no environment file.
+`observers.env`; admin, material and super read exactly `observers.env`
+and do not name `ring.env`.
 
 ## The cadence contract
 
@@ -575,9 +614,9 @@ consecutive cycles each at the 10 s ceiling) the newest heartbeat is 2 × 10 +
 1 s old: 30 s clears that with margin, 20 s does not, and 10 s would refuse
 a healthy ring. ghostunnel's gate is the second line behind the members' own
 V4a on super (the members halt a dead super at 20 s, the gate on its own at
-30 s), so the same value serves. Cycles actually run every 300 ms (`-min-
-cycle`), so in practice a heartbeat is at most a second or two old and a
-dead member is seen within one cadence.
+30 s), so the same value serves. Cycles actually run every 300 ms
+(`-min-cycle`), so in practice a heartbeat is at most a second or two old
+and a dead member is seen within one cadence.
 
 **The tick.** The proxy's trace emitter writes a `tick` line every
 `--ring-tick` and an `accept-error` line for every failed accept, so the
@@ -657,8 +696,8 @@ newest heartbeat is present, well-formed and younger than
 `--ring-heartbeat-max-age` and no `halt`, `fault` or delivered halt exists
 anywhere; then it serves, without a restart. There is no grace period and no
 "serve while the ring is not ready". Expect refused connections and
-`/_status` 503 for the first few seconds after `systemctl start`. That is
-the intended behaviour.
+`/_status` 503 for the first few seconds after `systemctl start`. A cold
+start refuses by design.
 
 ## When the ring halts
 
@@ -771,10 +810,14 @@ future observer needs the network, drop the line for that unit only.
   ${GT_EXPECT_TARGET}` and `-expect-acl ${GT_EXPECT_ACL}` with an
   `ExecStartPre` `test -n` on each, and
   `-expect-proxy-protocol=${GT_EXPECT_PROXY_PROTOCOL}`, and `ring.env` is
-  not named anywhere in the file; `ghostunnel.service` reads exactly
-  `ring.env`, does not name `observers.env`, and carries `WatchdogSec=` as
-  a positive count of seconds; no member carries `WatchdogSec=`; no unit
-  carries `-accept-no-store-check` or `-accept-no-sandbox`;
+  not named anywhere in the file; the material unit's `ExecStart` carries
+  `-expect-binary-sha256 ${GT_EXPECT_BINARY_SHA256}` with an `ExecStartPre`
+  `test -n`; each of those flags, and every unit's `-policy-query=`,
+  appears exactly once in its `ExecStart`, since a repeated flag's last
+  value wins; `ghostunnel.service` reads exactly `ring.env`, does not name
+  `observers.env`, and carries `WatchdogSec=` as a positive count of
+  seconds; no member carries `WatchdogSec=`; no unit carries
+  `-accept-no-store-check` or `-accept-no-sandbox`;
 - `ghostunnel.service` carries exactly `UMask=0027` and every member unit
   `UMask=0022` and `SupplementaryGroups=gtring-trace`; `tree.tsv` has `gt/`
   as `gt:gtring-trace 2750` and no other `2750` row, and the matrix row for

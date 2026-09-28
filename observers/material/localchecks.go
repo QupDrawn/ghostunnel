@@ -36,6 +36,9 @@ type LocalChecks interface {
 //   - material-loaded: the certificate, key, CA bundle and OPA policy files
 //     on disk are the ones ghostunnel loaded, and each is inside its validity
 //     window;
+//   - binary-expected: the executable the start line names still hashes to
+//     the recorded SHA-256, and that hash is the operator's
+//     -expect-binary-sha256;
 //   - key-private: the key file is a regular file readable by nobody but its
 //     owner and its group, and this observer is neither;
 //   - reload-succeeded: the last reload succeeded, and a failed reload halted

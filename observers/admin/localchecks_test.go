@@ -32,7 +32,7 @@ type adminSurface struct {
 var loopback = adminSurface{listen: `"127.0.0.1:6060"`, pprofRedacted: true, shutdownCert: true}
 
 func adminConfig(s adminSurface) string {
-	return fmt.Sprintf(`{"mode":"server","listen":"localhost:8443","target":"localhost:8080","proxy_protocol":"off","status_listen":%s,"status_client_cert":%t,"pprof_cmdline_redacted":%t,"shutdown_requires_client_cert":%t,"session_tickets":false,"verify_on_resume":true,"acl":["allow-cn:client.example"],"lifetime_cap_seconds":0,"sandbox_state":"applied","sandbox_accepted":null,"material":[]}`, s.listen, s.clientCert, s.pprofRedacted, s.shutdownCert)
+	return fmt.Sprintf(`{"mode":"server","listen":"localhost:8443","target":"localhost:8080","proxy_protocol":"off","status_listen":%s,"status_client_cert":%t,"pprof_cmdline_redacted":%t,"shutdown_requires_client_cert":%t,"session_tickets":false,"verify_on_resume":true,"acl":["allow-cn:client.example"],"lifetime_cap_seconds":0,"sandbox_state":"applied","sandbox_accepted":null,"material":[],"binary":{"path":"/usr/local/bin/ghostunnel","sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}`, s.listen, s.clientCert, s.pprofRedacted, s.shutdownCert)
 }
 
 func aHdr(kind string, seq int, at string) string {

@@ -2,18 +2,18 @@ package main
 
 // materialchecks.go is the material member's surface (observers/README,
 // "About ghostunnel"): the trust material and its reload as ghostunnel's
-// own trace under gt/ records it, compared with the files on disk. The
-// rules over the trace alone are surface_material.go, which every member
-// carries; what is this member's alone is the disk (material-loaded), the
-// process sandbox (sandbox-applied), the trace's own consistency across
-// cycles (tracememory.go), the liveness of every boot's process
-// (bootliveness.go), and the comparison of the other surfaces with what
-// their owners published (surfaces.go). Every check reads the current boot
-// through gtreader.go and fails closed: a trace that cannot be read, a
-// current boot with no start line, a material entry with no path or no
-// hash, a file that cannot be read or hashed, or a certificate that cannot
-// be parsed is a finding, never a skip. A check that cannot run has not
-// passed, and the heartbeat lists every identifier below as checked.
+// own trace under gt/ records it, compared with the files on disk. The rules
+// over the trace alone are surface_material.go, which every member carries;
+// what is this member's alone is the disk (material-loaded, binary-expected,
+// key-private), the process sandbox (sandbox-applied), the trace's own
+// consistency across cycles (tracememory.go), the liveness of every boot's
+// process (bootliveness.go), and the comparison of the other surfaces with
+// what their owners published (surfaces.go). Every check reads the current
+// boot through gtreader.go and fails closed: a trace that cannot be read, a
+// current boot with no start line, a material entry with no path or no hash,
+// a file that cannot be read or hashed, or a certificate that cannot be
+// parsed is a finding, never a skip. A check that cannot run has not passed,
+// and the heartbeat lists every identifier below as checked.
 //
 // Files are only ever read. The key file is never read at all: it is
 // stat'ed, since the trace carries no hash for it and the observer does
@@ -26,6 +26,7 @@ import (
 	"crypto/x509"
 	"encoding/hex"
 	"encoding/pem"
+	"fmt"
 	"io"
 	"os"
 	"time"
@@ -34,6 +35,15 @@ import (
 // The material member's own check identifiers (SPEC 15: constants of this
 // member's own code). The surface's are in surface_material.go.
 const (
+	// checkBinaryExpected: the executable the start line names is the
+	// build the operator expects, and it is still the file on disk. The
+	// file at config.binary.path is a regular file of at most
+	// maxBinaryBytes whose SHA-256 is config.binary.sha256, and that hash
+	// is -expect-binary-sha256. Subject: "changed" when the file cannot be
+	// read or hashes otherwise, since the proxy started from other bytes;
+	// "unexpected" when the start line's hash is not the operator's. Both
+	// can fail at once.
+	checkBinaryExpected = "binary-expected"
 	// checkTraceReadable: gt/ lists, the current boot reads under every
 	// rule of ringtrace/README 1.4, and it holds a start line. Subject: the
 	// path relative to gt/ where reading stopped, with the line when there
@@ -92,6 +102,12 @@ type MaterialChecks struct {
 	// asking. Nil selects the probe of this build (platformKeyProbe);
 	// tests inject one over synthetic entries.
 	KeyProbe keyProbe
+	// ExpectBinarySHA256 is -expect-binary-sha256: the SHA-256 the
+	// operator expects of the proxy's executable, as 64 lower-case hex
+	// characters, taken from outside the host (the release's SBOM, or the
+	// build's checksum at install). parseFlags refuses any other shape and
+	// refuses the flag's absence; "" agrees with no start line.
+	ExpectBinarySHA256 string
 	// TunnelMargins are the tunnel surface's values this member judges
 	// that surface with, which must be the tunnel member's own; its
 	// TickMaxAge is also this member's own tick-fresh age (-tick-max-age,
@@ -102,7 +118,7 @@ type MaterialChecks struct {
 // Identifiers lists what Run may report about this member's own world, in
 // evaluation order.
 func (c MaterialChecks) Identifiers() []string {
-	return []string{checkTraceReadable, checkMaterialLoaded, checkKeyPrivate, checkReloadSucceeded, checkSandboxApplied, checkResumptionBound, checkTickFresh, checkTraceConsistent, checkBootAmbiguous, checkBootEnded}
+	return []string{checkTraceReadable, checkMaterialLoaded, checkBinaryExpected, checkKeyPrivate, checkReloadSucceeded, checkSandboxApplied, checkResumptionBound, checkTickFresh, checkTraceConsistent, checkBootAmbiguous, checkBootEnded}
 }
 
 // RingIdentifiers lists what Run may report about the other members: the
@@ -204,6 +220,9 @@ func (c MaterialChecks) judge(boot *gtBoot, now time.Time) []Finding {
 		if !materialOnDisk(loaded[k], now) {
 			fail(checkMaterialLoaded, k.kind)
 		}
+	}
+	for _, subject := range binarySubjects(start.Config.Binary, c.ExpectBinarySHA256) {
+		fail(checkBinaryExpected, subject)
 	}
 	probe := c.KeyProbe
 	if probe == nil {
@@ -309,6 +328,71 @@ func materialOnDisk(m gtMaterial, now time.Time) bool {
 		return certificatesValid(data, now)
 	}
 	return true
+}
+
+// maxBinaryBytes bounds the read of the proxy's executable. A build is
+// about 50 MB; a larger file is refused unread.
+const maxBinaryBytes = 512 << 20
+
+// binarySubjects is the rule of binary-expected over the start line's
+// config.binary and the operator's expectation: "changed" when the file
+// at the path is not the bytes the proxy hashed at start, "unexpected"
+// when that hash is not the expected one; none when both hold. The file
+// is hashed in full on every call.
+func binarySubjects(b gtBinary, expect string) []string {
+	var out []string
+	if got, err := binaryDigest(b.Path); err != nil || got != b.SHA256 {
+		out = append(out, "changed")
+	}
+	if b.SHA256 != expect {
+		out = append(out, "unexpected")
+	}
+	return out
+}
+
+// binaryDigest returns the lower-case hex SHA-256 of the regular file at
+// path. The file is judged by Lstat first: a symbolic link, a directory or
+// a file above maxBinaryBytes is refused unread, and the file opened must
+// be the one judged. The read is bounded by maxBinaryBytes as well, since
+// the file may grow between the stat and the read. The open and the read
+// run under readRetrying as one operation.
+func binaryDigest(path string) (string, error) {
+	var digest string
+	err := readRetrying(func() error {
+		info, err := os.Lstat(path)
+		if err != nil {
+			return err
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("%s: not a regular file", path)
+		}
+		if info.Size() > maxBinaryBytes {
+			return fmt.Errorf("%s: %d bytes exceeds the bound", path, info.Size())
+		}
+		f, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		opened, err := f.Stat()
+		if err != nil {
+			return err
+		}
+		if !opened.Mode().IsRegular() || !os.SameFile(info, opened) {
+			return fmt.Errorf("%s: the file opened is not the one judged", path)
+		}
+		h := sha256.New()
+		n, err := io.Copy(h, io.LimitReader(f, maxBinaryBytes+1))
+		if err != nil {
+			return err
+		}
+		if n > maxBinaryBytes {
+			return fmt.Errorf("%s: exceeds the bound", path)
+		}
+		digest = hex.EncodeToString(h.Sum(nil))
+		return nil
+	})
+	return digest, err
 }
 
 // readRegular reads a regular file whole.

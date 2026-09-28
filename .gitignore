@@ -25,11 +25,14 @@ coverage/
 test-keys/
 tests/tmp_*
 website/content/contributors.md
+website/hugo.generated.toml
 website/public/
 website/static/pagefind/
 public/
 .claude
 .hugo_build.lock
+*.cdx.json
+*.spdx.json
 
 # Binaries a plain go build leaves beside each main package of the fork.
 *.exe

@@ -334,6 +334,7 @@ func (g *gen) body() Body {
 			StatusClientCert: g.bool(), PprofCmdlineRedacted: g.bool(), ShutdownRequiresClientCert: g.bool(),
 			SessionTickets: g.bool(), VerifyOnResume: g.bool(), ACL: g.acl(), LifetimeCapSeconds: g.nonNegative(),
 			SandboxState: g.pick(SandboxStates), SandboxAccepted: g.ptr(), Material: g.materials(),
+			Binary: Binary{Path: g.str(), SHA256: g.hash()},
 		}}
 	case 1:
 		return &Accept{Conn: g.positive(), Listener: g.nonEmpty(), Remote: g.nonEmpty()}
@@ -487,8 +488,8 @@ func TestAppendStringMatchesJSON(t *testing.T) {
 // TestEncodedKeysAreDocumented pins the encoder's own output to the
 // documented key lists: the keys of every line, in the order written, are
 // Keys(kind) (chain absent when the handshake has none), and the nested
-// config, peer and material objects carry ConfigKeys, PeerKeys and
-// MaterialKeys in order.
+// config, binary, peer and material objects carry ConfigKeys,
+// BinaryKeys, PeerKeys and MaterialKeys in order.
 func TestEncodedKeysAreDocumented(t *testing.T) {
 	at := time.Date(2026, 9, 24, 10, 7, 0, 0, time.UTC)
 	for i, body := range sampleBodies() {
@@ -518,6 +519,8 @@ func TestEncodedKeysAreDocumented(t *testing.T) {
 				want = ConfigKeys
 			case path == "peer":
 				want = PeerKeys
+			case path == "config.binary":
+				want = BinaryKeys
 			case strings.HasSuffix(path, "material[]"):
 				want = MaterialKeys
 			default:

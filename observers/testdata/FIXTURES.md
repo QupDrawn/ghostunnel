@@ -193,8 +193,8 @@ Grouping is by name prefix. `healthy-` and `benign-` fixtures must produce no co
 | `trace-task-not-completed` | tunnel | all alive | `trace-coverage` (daily) | raises `trace-coverage` | SPEC 14.2 T3 |
 | `trace-partial-line-ignored` | tunnel | all alive | none | none | SPEC 14.1 |
 | `trace-postcondition-nonzero` | tunnel | all alive | `postcondition` (expire-tokens) | raises `postcondition` | SPEC 14.2 T4 |
-| `trace-segment-pre-extended` | tunnel | all alive | none | none; `gt/` reads as 9 records, not torn, prefix 1894 bytes of a 5990-byte file | SPEC 14 (the segment rule), SPEC 14.3 |
-| `trace-segment-pre-extended-torn` | tunnel | all alive | none | none; `gt/` reads as 5 records, torn, prefix 1408 bytes of a 5538-byte file | SPEC 14 (the segment rule), SPEC 14.3, ringtrace/README.md 1.4 rule 5 |
+| `trace-segment-pre-extended` | tunnel | all alive | none | none; `gt/` reads as 9 records, not torn, prefix 2016 bytes of a 6112-byte file | SPEC 14 (the segment rule), SPEC 14.3 |
+| `trace-segment-pre-extended-torn` | tunnel | all alive | none | none; `gt/` reads as 5 records, torn, prefix 1530 bytes of a 5660-byte file | SPEC 14 (the segment rule), SPEC 14.3, ringtrace/README.md 1.4 rule 5 |
 | `substance-agree` | tunnel | all alive | none | none; surface: none (client chain allowed under `allow-cn`, other chain denied, client chain resumed and re-verified) | SPEC 14.3, ringtrace/README.md 1.5 |
 | `substance-acl-disagree` | tunnel | all alive | none | none; surface: `acl-substance` (1), `acl-substance` (2) (other chain recorded allowed under `allow-cn`; client chain recorded denied) | SPEC 14.3 |
 | `substance-chain-fails` | tunnel | all alive | none | none; surface: `handshake-substance` (1), `handshake-substance` (2), `acl-substance` (1), `acl-substance` (2) (rogue chain and expired chain recorded verified and allowed) | SPEC 14.3, ringtrace/README.md 1.5 |

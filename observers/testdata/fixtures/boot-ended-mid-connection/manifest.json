@@ -88,7 +88,7 @@
             "records": 2,
             "torn": false,
             "segments": {
-                "0000000001.trace": 858
+                "0000000001.trace": 980
             }
         },
         "boot_ended": {

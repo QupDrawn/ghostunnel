@@ -1,6 +1,6 @@
 {
     "fixture": "trace-segment-pre-extended-torn",
-    "description": "A partial line followed by NUL bytes is a torn tail of the content. The proxy's live segment holds five complete lines, the first 34 bytes of a sixth, and 4096 NUL bytes of unwritten space; by the segment rule (SPEC 14) the content ends at the first NUL, so the boot reads as five records with a torn tail (ringtrace/README.md 1.4 rule 5, benign in the last segment), the prefix of complete lines 1408 bytes long, and two reads over the same file leave trace-consistent nothing to report. The stores and schedule traces are those of trace-fresh-complete; the cycle's verdict is that fixture's.",
+    "description": "A partial line followed by NUL bytes is a torn tail of the content. The proxy's live segment holds five complete lines, the first 34 bytes of a sixth, and 4096 NUL bytes of unwritten space; by the segment rule (SPEC 14) the content ends at the first NUL, so the boot reads as five records with a torn tail (ringtrace/README.md 1.4 rule 5, benign in the last segment), the prefix of complete lines 1530 bytes long, and two reads over the same file leave trace-consistent nothing to report. The stores and schedule traces are those of trace-fresh-complete; the cycle's verdict is that fixture's.",
     "rules": [
         "SPEC 14",
         "SPEC 14.3"
@@ -86,7 +86,7 @@
             "records": 5,
             "torn": true,
             "segments": {
-                "0000000001.trace": 1408
+                "0000000001.trace": 1530
             }
         }
     }

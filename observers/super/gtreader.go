@@ -91,8 +91,9 @@ var (
 		"accept-error": {"error", "backoff_ms"},
 		"refusal":      {"source", "error"},
 	}
-	gtConfigKeys   = []string{"mode", "listen", "target", "proxy_protocol", "status_listen", "status_client_cert", "pprof_cmdline_redacted", "shutdown_requires_client_cert", "session_tickets", "verify_on_resume", "acl", "lifetime_cap_seconds", "sandbox_state", "sandbox_accepted", "material"}
+	gtConfigKeys   = []string{"mode", "listen", "target", "proxy_protocol", "status_listen", "status_client_cert", "pprof_cmdline_redacted", "shutdown_requires_client_cert", "session_tickets", "verify_on_resume", "acl", "lifetime_cap_seconds", "sandbox_state", "sandbox_accepted", "material", "binary"}
 	gtMaterialKeys = []string{"material", "path", "sha256"}
+	gtBinaryKeys   = []string{"path", "sha256"}
 	gtPeerKeys     = []string{"subject", "issuer", "serial", "sans", "fingerprint"}
 )
 
@@ -270,6 +271,15 @@ type gtConfig struct {
 	SandboxState               string  // one of gtSandboxStates
 	SandboxAccepted            *string // the OS an operator accepted no sandbox on; nil otherwise
 	Material                   []gtMaterial
+	Binary                     gtBinary // the executable the process started from, always present
+}
+
+// gtBinary is the start line's config.binary (README 1.2): the path the
+// process was executed from with every symbolic link resolved, and the
+// SHA-256 of that file's bytes when the process started.
+type gtBinary struct {
+	Path   string
+	SHA256 string
 }
 
 type gtMaterial struct {
@@ -896,6 +906,16 @@ func gtDecodeStart(obj *gtObject) (*gtStart, error) {
 	}
 	if cfg.Material, err = c.materials("material"); err != nil {
 		return nil, err
+	}
+	b, err := c.sub("binary", gtBinaryKeys)
+	if err != nil {
+		return nil, err
+	}
+	if cfg.Binary.Path, err = b.nonEmpty("path"); err != nil {
+		return nil, fmt.Errorf("config.binary.%v", err)
+	}
+	if cfg.Binary.SHA256, err = b.hash("sha256"); err != nil {
+		return nil, fmt.Errorf("config.binary.%v", err)
 	}
 	return s, nil
 }
