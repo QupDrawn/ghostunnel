@@ -17,7 +17,6 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"os"
 	"os/user"
 	"path"
 	"strconv"
@@ -41,7 +40,7 @@ type StoreTree struct {
 // readStoreTree reads the deployment's tree at p and keeps the rows of the
 // store identity.
 func readStoreTree(p, identity string) (*StoreTree, error) {
-	data, err := os.ReadFile(p)
+	data, err := readFile(p)
 	if err != nil {
 		return nil, err
 	}
@@ -167,7 +166,10 @@ func ownStorePaths(cfg *Config) []storeEntry {
 // be self and its mode must carry no group or other write bit; and
 // <self>/halts:writable when the halts/ directory, whatever the row says,
 // is one this member's uid could create in.
+// Each owner and group name is resolved once per call (memoLookup), a
+// failure as a failure; a call resolves every name afresh.
 func ownStoreMismatches(entries []storeEntry, tree *StoreTree, self string, who storeIdentity, uidOf, gidOf idLookup) []string {
+	uidOf, gidOf = memoLookup(uidOf), memoLookup(gidOf)
 	var out []string
 	for _, e := range entries {
 		if !e.Exists {
@@ -199,6 +201,25 @@ func ownStoreMismatches(entries []storeEntry, tree *StoreTree, self string, who 
 		}
 	}
 	return out
+}
+
+// memoLookup is lookup answering each name once: the first answer, id or
+// error, is every later answer for that name. It is made anew by each
+// ownStoreMismatches, so that nothing resolved outlives the cycle.
+func memoLookup(lookup idLookup) idLookup {
+	type answer struct {
+		id  uint32
+		err error
+	}
+	seen := map[string]answer{}
+	return func(name string) (uint32, error) {
+		if a, ok := seen[name]; ok {
+			return a.id, a.err
+		}
+		id, err := lookup(name)
+		seen[name] = answer{id, err}
+		return id, err
+	}
 }
 
 // canWrite is the discretionary rule for creating in a directory: root

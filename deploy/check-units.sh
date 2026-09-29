@@ -16,7 +16,8 @@
 #                and super judge the tunnel surface with tunnel's own
 #                -lifetime-margin and -acl-grace; every member's
 #                -slot-owners is the User= of each member's unit, one
-#                string on all four); the tunnel unit reads
+#                string on all four; every member's -window, passed or
+#                default, is the same on all four); the tunnel unit reads
 #                observers.env and never ring.env, and passes
 #                -expect-listen/-expect-target/-expect-acl (each tested
 #                non-empty) and -expect-proxy-protocol= from it; the
@@ -31,7 +32,9 @@
 #                (the group that reads gt/, which is gt:gtring-trace 2750);
 #                the target wants all five. This is what ran on the
 #                authoring host.
-#   --verify     Linux, units installed: systemd-analyze verify on each.
+#   --verify     Linux, units installed: each installed unit is byte for
+#                byte the one under systemd/ (the install copies them
+#                verbatim), and systemd-analyze verify passes on each.
 #   --tree       Linux, root: walk tree.tsv and compare owner:group:mode;
 #                check the halts/ groups' membership, and that gtring-pem
 #                holds the five and gtring-trace exactly the four observers
@@ -208,8 +211,8 @@ stage_static() {
   #    the cross-unit comparison in 2g.
   super_cadence=""
   RING_TICK_DEFAULT=5; TICK_MAX_AGE_DEFAULT=30
-  LIFETIME_MARGIN_DEFAULT=2s; ACL_GRACE_DEFAULT=2s
-  declare -A LM=() AG=() TMA=()
+  LIFETIME_MARGIN_DEFAULT=2s; ACL_GRACE_DEFAULT=2s; WINDOW_DEFAULT=3
+  declare -A LM=() AG=() TMA=() WIN=()
   ring_tick=$RING_TICK_DEFAULT
   if [[ -r $UNITS_DIR/ghostunnel.service ]]; then
     gt_exec=$(unit_lines "$UNITS_DIR/ghostunnel.service" | grep '^ExecStart=' | head -1)
@@ -348,6 +351,13 @@ stage_static() {
         spelled="-tick-max-age absent (default $tma)"
       fi
       TMA[$ident]=$tma
+      # -window: how many heartbeat entries each owner keeps (SPEC 6).
+      # Every reader's chain test assumes the writer's window, so it is
+      # compared across the members in 2g; absent stands for the default.
+      n=$(flag_count "$exec_line" -window)
+      (( n <= 1 )) || fail "$u: ExecStart carries -window $n times; at most once, or the last one wins"
+      win=$(flag_value "$exec_line" -window)
+      WIN[$ident]=${win:-$WINDOW_DEFAULT}
       if [[ -n $tsecs && -n $ring_tick ]]; then
         (( tsecs >= 2 * ring_tick )) && pass "$u: $spelled is at least twice --ring-tick ${ring_tick}s" || fail "$u: $spelled must be at least twice --ring-tick ${ring_tick}s"
       fi
@@ -444,6 +454,20 @@ stage_static() {
     done
   fi
 
+  # 2h. One window on all four: a reader holding a peer's hash from further
+  #     back than that peer's window finds no entry and fires I1.
+  if [[ -n ${WIN[tunnel]:-} ]]; then
+    for m in admin material super; do
+      [[ -n ${WIN[$m]:-} ]] || continue
+      u="ghostunnel-obs-$m.service"
+      if [[ ${WIN[$m]} == "${WIN[tunnel]}" ]]; then
+        pass "$u: -window ${WIN[$m]} equals tunnel's"
+      else
+        fail "$u: -window ${WIN[$m]} differs from tunnel's ${WIN[tunnel]}; every member must keep and read the same window"
+      fi
+    done
+  fi
+
   # 3. The target wants all five; every service is wanted by the target.
   t="$UNITS_DIR/ghostunnel-ring.target"
   if [[ -r $t ]]; then
@@ -458,11 +482,20 @@ stage_static() {
 }
 
 # ---------------------------------------------------------------------------
+# The install copies the units verbatim (README, Install step 6), so an
+# installed unit that differs from systemd/ in any byte is not the unit
+# --static checked, however valid it is.
+unit_installed_as_repo() { # installed-dir unit
+  if [[ ! -e $1/$2 ]]; then fail "$2 not installed in $1"; return 1; fi
+  if cmp -s -- "$UNITS_DIR/$2" "$1/$2"; then pass "$2 in $1 is systemd/$2 byte for byte"; else fail "$2 in $1 differs from systemd/$2"; fi
+}
+
 stage_verify() {
-  echo "== verify: systemd-analyze verify on the installed units"
+  echo "== verify: the installed units are systemd/'s, and systemd-analyze verify on each"
+  command -v cmp >/dev/null || { fail "cmp not found"; return; }
   command -v systemd-analyze >/dev/null || { fail "systemd-analyze not found"; return; }
   for u in "${ALL_UNITS[@]}"; do
-    if [[ ! -e /etc/systemd/system/$u ]]; then fail "$u not installed in /etc/systemd/system"; continue; fi
+    unit_installed_as_repo /etc/systemd/system "$u" || continue
     if systemd-analyze verify "/etc/systemd/system/$u"; then pass "$u verifies"; else fail "$u: systemd-analyze verify reported problems"; fi
   done
 }
@@ -814,7 +847,9 @@ stage_namespace() {
 }
 
 # ---------------------------------------------------------------------------
-[[ $# -ge 1 ]] || { sed -n '2,55p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+# Usage is the header comment: every line from the second up to the first
+# that is not a comment.
+[[ $# -ge 1 ]] || { awk 'NR > 1 && !/^#/ { exit } NR > 1 { sub(/^# ?/, ""); print }' "$0"; exit 2; }
 for arg in "$@"; do
   case "$arg" in
     --static) stage_static ;;

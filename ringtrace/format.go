@@ -378,11 +378,18 @@ func nonNegative(v int64, name string) error {
 // noPEM refuses any string that carries a PEM header: a caller that put
 // key material or a certificate body into a field is refused, not recorded.
 func noPEM(value, name string) error {
-	if strings.Contains(value, "-----BEGIN") {
+	if hasPEM(value) {
 		return fmt.Errorf("%s: contains a PEM block", name)
 	}
 	return nil
 }
+
+// hasPEM reports whether value carries the start of a PEM block.
+func hasPEM(value string) bool { return strings.Contains(value, "-----BEGIN") }
+
+// field is a string field of a line by its name, for the checks that run
+// over several in one fixed order: the first that fails is the error.
+type field struct{ name, value string }
 
 func noPEMPtr(value *string, name string) error {
 	if value == nil {
@@ -407,7 +414,7 @@ func validateMaterials(ms []Material, name string) error {
 			if m.Material == "key" {
 				return fmt.Errorf("%s: a key never carries a hash", n)
 			}
-			if !reHash.MatchString(*m.SHA256) {
+			if !isHash(*m.SHA256) {
 				return fmt.Errorf("%s.sha256: not a lower-case SHA-256 hex string", n)
 			}
 		}
@@ -455,7 +462,7 @@ func validateACLRule(rule, name string) error {
 		if value == "" {
 			return fmt.Errorf("%s: %q has no value", name, rule)
 		}
-		if prefix == "policy:" && !reHash.MatchString(value) {
+		if prefix == "policy:" && !isHash(value) {
 			return fmt.Errorf("%s: policy is not followed by a lower-case SHA-256 hex string", name)
 		}
 		return nil
@@ -474,11 +481,11 @@ func (s *Start) validate() error {
 	if err := oneOf(c.Mode, Modes, "config.mode"); err != nil {
 		return err
 	}
-	for name, v := range map[string]string{"config.listen": c.Listen, "config.target": c.Target} {
-		if err := nonEmpty(v, name); err != nil {
+	for _, f := range [...]field{{"config.listen", c.Listen}, {"config.target", c.Target}} {
+		if err := nonEmpty(f.value, f.name); err != nil {
 			return err
 		}
-		if err := noPEM(v, name); err != nil {
+		if err := noPEM(f.value, f.name); err != nil {
 			return err
 		}
 	}
@@ -520,7 +527,7 @@ func validateBinary(b Binary) error {
 	if err := noPEM(b.Path, "config.binary.path"); err != nil {
 		return err
 	}
-	if !reHash.MatchString(b.SHA256) {
+	if !isHash(b.SHA256) {
 		return errors.New("config.binary.sha256: not a lower-case SHA-256 hex string")
 	}
 	return nil
@@ -530,11 +537,11 @@ func (a *Accept) validate() error {
 	if err := positive(a.Conn, "conn"); err != nil {
 		return err
 	}
-	for name, v := range map[string]string{"listener": a.Listener, "remote": a.Remote} {
-		if err := nonEmpty(v, name); err != nil {
+	for _, f := range [...]field{{"listener", a.Listener}, {"remote", a.Remote}} {
+		if err := nonEmpty(f.value, f.name); err != nil {
 			return err
 		}
-		if err := noPEM(v, name); err != nil {
+		if err := noPEM(f.value, f.name); err != nil {
 			return err
 		}
 	}
@@ -555,8 +562,8 @@ func (h *Handshake) validate() error {
 		return err
 	}
 	if p := h.Peer; p != nil {
-		for name, v := range map[string]string{"peer.subject": p.Subject, "peer.issuer": p.Issuer, "peer.serial": p.Serial} {
-			if err := noPEM(v, name); err != nil {
+		for _, f := range [...]field{{"peer.subject", p.Subject}, {"peer.issuer", p.Issuer}, {"peer.serial", p.Serial}} {
+			if err := noPEM(f.value, f.name); err != nil {
 				return err
 			}
 		}
@@ -564,15 +571,15 @@ func (h *Handshake) validate() error {
 			return errors.New("peer.sans: nil")
 		}
 		for i, s := range p.SANs {
-			if err := noPEM(s, fmt.Sprintf("peer.sans[%d]", i)); err != nil {
-				return err
+			if hasPEM(s) {
+				return noPEM(s, fmt.Sprintf("peer.sans[%d]", i))
 			}
 		}
-		if !reHash.MatchString(p.Fingerprint) {
+		if !isHash(p.Fingerprint) {
 			return errors.New("peer.fingerprint: not a lower-case SHA-256 hex string")
 		}
 	}
-	if h.Chain != "" && !reHash.MatchString(h.Chain) {
+	if h.Chain != "" && !isHash(h.Chain) {
 		return errors.New("chain: not a lower-case SHA-256 hex string")
 	}
 	return nil
@@ -588,8 +595,8 @@ func (a *ACL) validate() error {
 	if err := nonEmpty(a.Rule, "rule"); err != nil {
 		return err
 	}
-	for name, v := range map[string]string{"rule": a.Rule, "reason": a.Reason} {
-		if err := noPEM(v, name); err != nil {
+	for _, f := range [...]field{{"rule", a.Rule}, {"reason", a.Reason}} {
+		if err := noPEM(f.value, f.name); err != nil {
 			return err
 		}
 	}
@@ -690,6 +697,14 @@ func EncodeLine(r Record) ([]byte, error) {
 // that a batch of lines is one allocation (the emitter's write). On an
 // error nothing has been appended and dst is returned as given.
 func AppendLine(dst []byte, r Record) ([]byte, error) {
+	var ts [len(timestampLayout)]byte
+	return appendLine(dst, r, r.At.UTC().AppendFormat(ts[:0], timestampLayout))
+}
+
+// appendLine is AppendLine with r.At already formatted: at must be the
+// bytes r.At.UTC().AppendFormat gives for timestampLayout, which the
+// emitter formats once for a batch whose lines share one timestamp.
+func appendLine(dst []byte, r Record, at []byte) ([]byte, error) {
 	if r.Body == nil {
 		return dst, errors.New("ringtrace: nil body")
 	}
@@ -713,7 +728,7 @@ func AppendLine(dst []byte, r Record) ([]byte, error) {
 	// timestampLayout is digits, '-', ':', 'T' and a literal 'Z': nothing
 	// appendString would escape, so the bytes are what quoting
 	// formatTimestamp(r.At) gives, written in place.
-	out = r.At.UTC().AppendFormat(out, timestampLayout)
+	out = append(out, at...)
 	out = append(out, '"')
 	switch b := r.Body.(type) {
 	case *Start:

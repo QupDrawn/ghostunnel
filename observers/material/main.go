@@ -127,7 +127,7 @@ func parseFlags(args []string) (*Config, time.Duration, int64, error) {
 	fs.StringVar(&cfg.PolicyQuery, "policy-query", "", "the proxy's --allow-query: the OPA query the policy named by the start line's policy:<hash> rule is evaluated with, for acl-substance; the trace does not record it, so it is set here, the same on every member; empty means a policy rule cannot be re-judged and acl-substance fails on every acl line under one")
 	fs.StringVar(&tree, "tree", "/etc/ghostunnel/tree.tsv", "the deployment's tree (deploy/tree.tsv): owner, group and mode of every directory of the store tree, for own-store-private; read on start, on linux only")
 	fs.StringVar(&cfg.AcceptNoStoreCheck, "accept-no-store-check", "", "the OS this observer runs on, as Go names it, to accept that own-store-private cannot run there; refused unless it equals this OS exactly, and refused on linux, where the check runs")
-	fs.IntVar(&cfg.Window, "window", 4, "WINDOW")
+	fs.IntVar(&cfg.Window, "window", 3, "WINDOW")
 	fs.Float64Var(&cfg.StaleSlack, "stale-slack", 1, "STALE_SLACK")
 	fs.DurationVar(&cfg.StagingStaleAfter, "staging-stale-after", 60*time.Second, "STAGING_STALE_AFTER_SECONDS")
 	fs.Int64Var(&cfg.MaxHeartbeatBytes, "max-heartbeat-bytes", 8192, "MAX_HEARTBEAT_BYTES")
@@ -265,14 +265,14 @@ func startUp(cfg *Config) (*State, error) {
 		if !reHeartbeatName.MatchString(de.Name()) || !de.Type().IsRegular() {
 			continue
 		}
-		b, err := os.ReadFile(filepath.Join(hbDir, de.Name()))
+		b, err := readFile(filepath.Join(hbDir, de.Name()))
 		if err != nil {
 			return nil, fmt.Errorf("own heartbeat %s cannot be read: %w", de.Name(), err)
 		}
 		st.Memory[path.Join(self, "heartbeat", de.Name())] = sha256Hex(b)
 	}
 	for _, f := range []string{"fault", "halt"} {
-		b, err := os.ReadFile(filepath.Join(own, f))
+		b, err := readFile(filepath.Join(own, f))
 		if err == nil {
 			st.Memory[path.Join(self, f)] = sha256Hex(b)
 		}

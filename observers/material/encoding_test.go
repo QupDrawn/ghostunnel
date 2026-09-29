@@ -588,3 +588,105 @@ func TestDryRunWritesNothing(t *testing.T) {
 		t.Error("heartbeat 45 was written during a dry run")
 	}
 }
+
+// SPEC 6 at the deployment's window of 3: the owner keeps the three most
+// recent entries, a reader finds its record while it is at most two cycles
+// old, and a record three cycles old is outside the chain (V7, I1). The
+// folder may hold WINDOW + 1 entries between the publish and the prune,
+// and no more (C2).
+func TestWindowThree(t *testing.T) {
+	adminHash := func(t *testing.T, tmp string, seq int64) *string {
+		h := hashFile(t, hbPath(tmp, "admin", seq, "heartbeat"))
+		return &h
+	}
+	pruned := func(t *testing.T, tmp string) {
+		for _, dir := range [][]string{{"admin", "heartbeat"}, {"material", "copy", "heartbeat"}, {"super", "copy-admin", "heartbeat"}} {
+			d := filepath.Join(append([]string{tmp, "stores"}, dir...)...)
+			prune(d, 44, 3, nil, "")
+			if names := listHeartbeats(t, d); strings.Join(names, ",") != "0000000042.hb,0000000043.hb,0000000044.hb" {
+				t.Fatalf("%s pruned at window 3 to %v", d, names)
+			}
+		}
+	}
+	// A record two cycles old (42, with 44 current): in the window, alive.
+	cfg, st, tmp := fixtureCopy(t, "chain-ancestor-in-window")
+	cfg.Window = 3
+	pruned(t, tmp)
+	st.Basis["admin"] = adminHash(t, tmp, 42)
+	out, err := RunCycle(cfg, st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Verdicts["admin"] != VerdictAlive || hasFinding(out, "I1", "admin") {
+		t.Fatalf("a record two cycles old at window 3: admin %v, failing %v", out.Verdicts["admin"], out.Failing)
+	}
+	// A record three cycles old (41): pruned at window 3, so I1.
+	cfg, st, tmp = fixtureCopy(t, "chain-ancestor-in-window")
+	cfg.Window = 3
+	st.Basis["admin"] = adminHash(t, tmp, 41)
+	pruned(t, tmp)
+	out, err = RunCycle(cfg, st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Verdicts["admin"] != VerdictUnknown || !hasFinding(out, "I1", "admin") {
+		t.Fatalf("a record three cycles old at window 3: admin %v, failing %v", out.Verdicts["admin"], out.Failing)
+	}
+	// Unpruned, 41 to 44 is WINDOW + 1 at window 3: the transient between
+	// publish and prune, no S3; a fifth entry is S3.
+	cfg, st, _ = fixtureCopy(t, "chain-ancestor-in-window")
+	cfg.Window = 3
+	out, err = RunCycle(cfg, st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hasFinding(out, "S3", "admin/heartbeat") {
+		t.Fatalf("WINDOW + 1 entries at window 3 fired S3: %v", out.Failing)
+	}
+	cfg, st, tmp = fixtureCopy(t, "chain-ancestor-in-window")
+	cfg.Window = 3
+	if err := os.WriteFile(hbPath(tmp, "admin", 40, "heartbeat"), []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, err = RunCycle(cfg, st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasFinding(out, "S3", "admin/heartbeat") {
+		t.Fatalf("WINDOW + 2 entries at window 3 fired no S3: %v", out.Failing)
+	}
+}
+
+// declaredLocal is local checks that declare two identifiers and fail
+// with one of them and with a ring identifier.
+type declaredLocal struct{}
+
+func (declaredLocal) Identifiers() []string     { return []string{"local-a", "local-b"} }
+func (declaredLocal) RingIdentifiers() []string { return []string{"ring-x"} }
+func (declaredLocal) Run(*Config, *State, map[string]PeerView) []Finding {
+	return []Finding{{Check: "local-b", Subject: "s"}, {Check: "ring-x", Subject: "admin"}}
+}
+
+// SPEC 3.3: the fault carries the structural local checks and every
+// identifier the member's local checks declare, and nothing about another
+// member. The set is built once for the cycle (localSet).
+func TestFaultCarriesTheDeclaredLocalChecks(t *testing.T) {
+	cfg, st, _ := fixtureCopy(t, "healthy-ring")
+	cfg.Local = declaredLocal{}
+	set := localSet(cfg)
+	for id := range structuralLocal {
+		if !set[id] {
+			t.Fatalf("%s is structural and local, and not in the set", id)
+		}
+	}
+	if !set["local-a"] || !set["local-b"] || set["ring-x"] || set["I1"] || len(set) != len(structuralLocal)+2 {
+		t.Fatalf("the local set is %v", set)
+	}
+	out, err := RunCycle(cfg, st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Fault.Local) != 1 || out.Fault.Local[0] != (Finding{Check: "local-b", Subject: "s"}) {
+		t.Fatalf("the fault carries %v, want the one declared local finding", out.Fault.Local)
+	}
+}

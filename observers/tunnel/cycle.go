@@ -317,8 +317,9 @@ func (r *reader) buildPublish(out *Outcome) error {
 func (r *reader) buildFault(out *Outcome) error {
 	self := r.cfg.Identity
 	var local []Finding
+	isLocal := localSet(r.cfg)
 	for _, f := range r.findings {
-		if isLocal(r.cfg, f.Check) {
+		if isLocal[f.Check] {
 			local = append(local, f)
 		}
 	}
@@ -441,6 +442,9 @@ type fileRead struct {
 	data      []byte
 	oversized bool
 	err       error
+	// sum is the SHA-256 of data once a check has asked for it (hashOf),
+	// "" before.
+	sum string
 }
 
 // The reads beneath the snapshot. They are variables only so that a test
@@ -508,6 +512,32 @@ func (r *reader) readWithin(disk string, max int64) ([]byte, bool, error) {
 	data, oversized, err := readEntry(disk, max)
 	r.snap.files[disk] = &fileRead{max: max, data: data, oversized: oversized, err: err}
 	return data, oversized, err
+}
+
+// hashOf is the SHA-256 (sha256Hex) of data, the bytes a read of disk
+// returned this cycle: taken once for the bytes the snapshot holds for
+// disk and served to every later check that hashes those very bytes (I5
+// and procedure C over the own heartbeat). Bytes that are not the
+// snapshot's own, the same slice, are hashed as they are.
+func (r *reader) hashOf(disk string, data []byte) string {
+	f, ok := r.snap.files[disk]
+	if !ok || !sameBytes(f.data, data) {
+		return snapshotSum(data)
+	}
+	if f.sum == "" {
+		f.sum = snapshotSum(f.data)
+	}
+	return f.sum
+}
+
+// snapshotSum is the hash hashOf takes. It is a variable only so that a
+// test can count the hashes a cycle takes.
+var snapshotSum = sha256Hex
+
+// sameBytes reports whether a and b are one slice: the same length over
+// the same first byte.
+func sameBytes(a, b []byte) bool {
+	return len(a) == len(b) && (len(a) == 0 || &a[0] == &b[0])
 }
 
 // exists reports whether a regular file exists at the store path, as this

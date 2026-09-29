@@ -507,6 +507,9 @@ func TestMaterialAcceptNoSandboxFlag(t *testing.T) {
 	if local := cfg.Local.(MaterialChecks); local.AcceptNoSandbox != "" || local.GOOS != runtime.GOOS {
 		t.Fatalf("defaults carry %+v", local)
 	}
+	if cfg.Window != 3 {
+		t.Fatalf("the default window is %d, want the deployment's 3 (SPEC 6)", cfg.Window)
+	}
 	cfg, _, _, err = parseFlags(append(base, "-accept-no-sandbox="+runtime.GOOS))
 	if runtime.GOOS == "linux" {
 		if err == nil {

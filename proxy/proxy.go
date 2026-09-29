@@ -608,7 +608,8 @@ func (p *Proxy) dialBackend(ctx context.Context) (net.Conn, error) {
 	return conn, nil
 }
 
-// Wait until the proxy is shut down (listener closed, connections drained).
+// Wait until the proxy is shut down (listener closed, connections drained,
+// and the observer's Closed returned for every one of them).
 // This function will block even if the proxy isn't in the accept loop yet,
 // so it's safe to concurrently run Accept() in a Goroutine and then immediately
 // call Wait().
@@ -727,6 +728,9 @@ func (p *Proxy) Accept() {
 			// The observer, if any, follows this connection; reason is why it
 			// ended, reported once the connection is closed, unless CloseAll
 			// ended it first, in which case its reason is reported instead.
+			// The slot is released before Closed, so the close line's sync
+			// does not hold it; the handler is done only once Closed has
+			// returned, so Wait never returns before the close is recorded.
 			var observer ConnObserver
 			reason := CloseEOF
 			live := p.track(conn)
@@ -734,11 +738,11 @@ func (p *Proxy) Accept() {
 				conn.Close()
 				p.untrack(live)
 				p.metrics.OpenCounter.Dec(1)
-				p.handlers.Done()
 				p.connSemaphore.Release(1)
 				if observer != nil {
 					observer.Closed(live.reason(reason))
 				}
+				p.handlers.Done()
 			}()
 
 			p.setSocketBuffers(conn)
@@ -759,11 +763,19 @@ func (p *Proxy) Accept() {
 			defer cancel()
 
 			err := forceHandshake(ctx, conn, p.metrics)
-			if observer != nil {
-				if tlsConn, ok := conn.(*tls.Conn); ok {
-					state := tlsConn.ConnectionState()
-					observer.Handshake(&state, err)
-				}
+			// The connection state is taken once, here: a server
+			// connection's state is fixed once its handshake has finished,
+			// and everything below reads this copy. The observer is handed
+			// a copy of its own, so nothing it does to it reaches the
+			// checks below.
+			var state *tls.ConnectionState
+			if tlsConn, ok := conn.(*tls.Conn); ok {
+				s := tlsConn.ConnectionState()
+				state = &s
+			}
+			if observer != nil && state != nil {
+				own := *state
+				observer.Handshake(&own, err)
 			}
 			if err != nil {
 				p.metrics.ErrorCounter.Inc(1)
@@ -780,7 +792,7 @@ func (p *Proxy) Accept() {
 			// must never reach the backend. The handshake itself ran with
 			// ClientAuth relaxed (see certloader/acmetlsconfig.go); refusing
 			// to proxy ensures that relaxation cannot become an mTLS bypass.
-			if isACMEChallengeConn(conn) {
+			if isACMEChallenge(state) {
 				p.logConditional(LogConnections, "completed ACME TLS-ALPN-01 challenge from %s; not forwarding to backend", conn.RemoteAddr())
 				reason = CloseRefused
 				return
@@ -817,12 +829,7 @@ func (p *Proxy) Accept() {
 			live.setBackend(backend)
 
 			if p.proxyProtocol != ProxyProtocolOff {
-				var tlsState *tls.ConnectionState
-				if tlsConn, ok := conn.(*tls.Conn); ok {
-					state := tlsConn.ConnectionState()
-					tlsState = &state
-				}
-				h, err := proxyProtoHeader(conn, tlsState, p.proxyProtocol)
+				h, err := proxyProtoHeader(conn, state, p.proxyProtocol)
 				if err != nil {
 					p.metrics.ErrorCounter.Inc(1)
 					p.logConditional(LogConnectionErrors, "error building proxy header: %s", err)
@@ -845,17 +852,14 @@ func (p *Proxy) Accept() {
 	}
 }
 
-// isACMEChallengeConn reports whether the (already-handshaken) connection
-// negotiated the TLS-ALPN-01 challenge protocol from RFC 8737. Such a
-// connection is an ACME validator probe and must not be proxied to the
-// backend: the relaxed ClientAuth in certloader/acmetlsconfig.go is scoped
-// to making the handshake complete, not to authorizing application data.
-func isACMEChallengeConn(conn net.Conn) bool {
-	tlsConn, ok := conn.(*tls.Conn)
-	if !ok {
-		return false
-	}
-	return tlsConn.ConnectionState().NegotiatedProtocol == "acme-tls/1"
+// isACMEChallenge reports whether the state of an already-handshaken
+// connection (nil for one that is not TLS) negotiated the TLS-ALPN-01
+// challenge protocol from RFC 8737. Such a connection is an ACME validator
+// probe and must not be proxied to the backend: the relaxed ClientAuth in
+// certloader/acmetlsconfig.go is scoped to making the handshake complete,
+// not to authorizing application data.
+func isACMEChallenge(state *tls.ConnectionState) bool {
+	return state != nil && state.NegotiatedProtocol == "acme-tls/1"
 }
 
 // Force handshake. Handshake usually happens on first read/write, but we want

@@ -47,6 +47,8 @@ import (
 	"time"
 
 	"github.com/ghostunnel/ghostunnel/auth"
+	"github.com/ghostunnel/ghostunnel/certloader"
+	"github.com/ghostunnel/ghostunnel/policy"
 	"github.com/ghostunnel/ghostunnel/proxy"
 	"github.com/ghostunnel/ghostunnel/ringtrace"
 )
@@ -155,9 +157,11 @@ type ring struct {
 	acl     auth.ACL
 	// verifier is whether a peer certificate verifier is installed on the
 	// tunnel's TLS config; when it is, a handshake that completes has run it.
-	verifier   bool
-	policyPath string
-	conns      atomic.Int64
+	verifier bool
+	// loaded is what loaded the material, whose loads hand back the bytes
+	// of the files they parsed (ringMaterial).
+	loaded ringSources
+	conns  atomic.Int64
 
 	// failed is the first error the emitter or the chain store returned. It
 	// is sticky here as well as in the emitter, because an event that could
@@ -177,9 +181,11 @@ type ring struct {
 	// surface is part of what the ring observes.
 	statusFailed error
 
-	// stop ends the watch goroutine; closed once by close.
+	// stop ends the tick and watch goroutines; closed once by close, which
+	// waits on loops for both to return before it closes the trace.
 	stop     chan struct{}
 	stopOnce sync.Once
+	loops    sync.WaitGroup
 }
 
 // openRing opens the emitter (which stores the CA bundle the configuration
@@ -192,14 +198,14 @@ type ring struct {
 // without it). The gate reads nothing here: whether the store tree is
 // present and the coordinator alive is decided on every accept, and until
 // it is, every connection is refused.
-func openRing(cfg ringtrace.Config, ca []byte, acl auth.ACL, verifier bool, policyPath string) (*ring, error) {
+func openRing(cfg ringtrace.Config, ca []byte, acl auth.ACL, verifier bool, loaded ringSources) (*ring, error) {
 	if err := validateRingFlags(); err != nil {
 		return nil, err
 	}
 	if err := validateSandboxAcceptance(*acceptNoSandbox, runtime.GOOS, cfg.SandboxState); err != nil {
 		return nil, err
 	}
-	r := &ring{mode: cfg.Mode, acl: acl, verifier: verifier, policyPath: policyPath, stop: make(chan struct{})}
+	r := &ring{mode: cfg.Mode, acl: acl, verifier: verifier, loaded: loaded, stop: make(chan struct{})}
 	emitter, err := ringtrace.Open(*ringTraces, ringtrace.Options{Config: cfg, Now: ringNow, CABundle: ca})
 	if err != nil {
 		logger.Printf("error: unable to open the ring trace: %s", err)
@@ -215,8 +221,26 @@ func openRing(cfg ringtrace.Config, ca []byte, acl auth.ACL, verifier bool, poli
 	} else {
 		logger.Printf("ring: consulting the stores under %s on every accept: scanned on every change reported, and every %s regardless", *ringStores, ringWatchInterval)
 	}
-	go r.tick(*ringTick)
+	r.startTick(*ringTick)
 	return r, nil
+}
+
+// startTick starts tick on its own goroutine, one close waits for.
+func (r *ring) startTick(interval time.Duration) {
+	r.loops.Add(1)
+	go func() {
+		defer r.loops.Done()
+		r.tick(interval)
+	}()
+}
+
+// startWatch starts watch on its own goroutine, one close waits for.
+func (r *ring) startWatch(p *proxy.Proxy) {
+	r.loops.Add(1)
+	go func() {
+		defer r.loops.Done()
+		r.watch(p)
+	}()
 }
 
 // tick writes the trace's own heartbeat, a tick line every interval,
@@ -336,8 +360,9 @@ func ringProxyProtocol(mode proxy.ProxyProtocolMode) (string, error) {
 // decided it, and the rules the verifier applies. Every value describes
 // what the code at this revision does; nothing here is aspirational. The
 // CA bundle's bytes as hashed are returned beside the configuration, for
-// openRing to store before the start line names their hash.
-func ringConfig(mode, listen, target string, proxyProtocol proxy.ProxyProtocolMode, tunnel *tls.Config, sandbox string, policyPath string, rules ringRules) (ringtrace.Config, []byte, error) {
+// openRing to store before the start line names their hash; the material
+// is what loaded handed back (ringMaterial).
+func ringConfig(mode, listen, target string, proxyProtocol proxy.ProxyProtocolMode, tunnel *tls.Config, sandbox string, loaded ringSources, rules ringRules) (ringtrace.Config, []byte, error) {
 	pp, err := ringProxyProtocol(proxyProtocol)
 	if err != nil {
 		return ringtrace.Config{}, nil, err
@@ -373,7 +398,7 @@ func ringConfig(mode, listen, target string, proxyProtocol proxy.ProxyProtocolMo
 		// exactly when a VerifyPeerCertificate callback is present.
 		cfg.VerifyOnResume = tunnel.VerifyPeerCertificate != nil && tunnel.VerifyConnection != nil
 	}
-	material, ca, err := ringMaterial(policyPath)
+	material, ca, err := ringMaterial(loaded)
 	if err != nil {
 		return cfg, nil, err
 	}
@@ -464,26 +489,69 @@ func lifetimeCapSeconds(d time.Duration) int64 {
 	return int64(math.Ceil(d.Seconds()))
 }
 
+// ringSources is what loaded the trust material: the tunnel's TLS
+// configuration source and, when --allow-policy or --verify-policy names
+// one, the policy and its path.
+type ringSources struct {
+	tls        certloader.TLSConfigSource
+	policy     policy.Policy
+	policyPath string
+}
+
 // ringMaterial lists the trust material as configured, with the SHA-256 of
-// each file as it stands now. A file that holds the private key (--key, or
-// a --keystore, which holds both) is listed without a hash. Material that
-// is not a file (the system trust store, a keychain, PKCS#11, SPIFFE, ACME)
-// has an empty path. A file that cannot be read is listed with no hash and
-// reported in the returned error. The CA bundle's bytes, exactly those
-// hashed, are returned beside the list (nil when there is no bundle file
-// or it could not be read) for the material store (ringtrace.StoreMaterial,
-// at Open and before every reload line): the members verify presented
-// chains against the bundle by its hash, not by its path, so what was
-// hashed must be kept.
-func ringMaterial(policyPath string) ([]ringtrace.Material, []byte, error) {
+// each file as loaded. The certificate file, the CA bundle and the policy
+// are hashed from the bytes their last successful load read and parsed or
+// compiled (certloader.LoadedFiles, policy.LoadedFileOf), never from a
+// second read of the path, so a file swapped after the load is not what is
+// recorded; after a failed reload that is still the material of the last
+// load, which is what is in use. A TLS source that does not hand its files
+// back (PKCS#11, a keychain, SPIFFE) has them read here. A file that holds
+// the private key (--key, or a --keystore, which holds both) is listed
+// without a hash. Material that is not a file (the system trust store, a
+// keychain, PKCS#11, SPIFFE, ACME) has an empty path. A file that cannot
+// be read, or that its loader did not load from the configured path, is
+// listed with no hash and reported in the returned error, as is a nil TLS
+// source and a policy path with no policy loaded from it. The CA bundle's
+// bytes, exactly those hashed, are returned beside the list (nil when
+// there is no bundle file or it could not be read) for the material store
+// (ringtrace.StoreMaterial, at Open and before every reload line): the
+// members verify presented chains against the bundle by its hash, not by
+// its path, so what was hashed must be kept.
+func ringMaterial(sources ringSources) ([]ringtrace.Material, []byte, error) {
 	var errs []error
 	var ca []byte
+	if sources.tls == nil {
+		errs = append(errs, errors.New("ring: no TLS configuration source to take the loaded material from"))
+	}
+	loaded, fromLoader := certloader.LoadedFilesOf(sources.tls)
+	// read is the file's bytes as its load read them, or as read now for
+	// a TLS source that does not hand its files back.
+	read := func(kind, path string) ([]byte, error) {
+		if kind == "policy" {
+			if loadedPath, data, ok := policy.LoadedFileOf(sources.policy); ok && loadedPath == path && data != nil {
+				return data, nil
+			}
+			return nil, fmt.Errorf("no policy was loaded from %s", path)
+		}
+		if !fromLoader {
+			return os.ReadFile(path)
+		}
+		if loaded != nil {
+			switch {
+			case kind == "cert" && loaded.CertificatePath == path && loaded.Certificate != nil:
+				return loaded.Certificate, nil
+			case kind == "ca" && loaded.CABundlePath == path && loaded.CABundle != nil:
+				return loaded.CABundle, nil
+			}
+		}
+		return nil, fmt.Errorf("the TLS configuration source did not load %s", path)
+	}
 	hashed := func(kind, path string) ringtrace.Material {
 		m := ringtrace.Material{Material: kind, Path: path}
 		if path == "" {
 			return m
 		}
-		data, err := os.ReadFile(path)
+		data, err := read(kind, path)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", kind, err))
 			return m
@@ -508,8 +576,8 @@ func ringMaterial(policyPath string) ([]ringtrace.Material, []byte, error) {
 		material = append(material, ringtrace.Material{Material: "cert"}, ringtrace.Material{Material: "key"})
 	}
 	material = append(material, hashed("ca", *caBundlePath))
-	if policyPath != "" {
-		material = append(material, hashed("policy", policyPath))
+	if sources.policyPath != "" {
+		material = append(material, hashed("policy", sources.policyPath))
 	}
 	return material, ca, errors.Join(errs...)
 }
@@ -738,6 +806,8 @@ func (r *ring) watch(p *proxy.Proxy) {
 
 // close stops the watch, the ticks and the store tree's change
 // notification, then syncs and closes the trace once the proxy has drained.
+// The tick and the watch have returned before the trace is closed, so
+// neither writes to a closed trace.
 func (r *ring) close() {
 	if r == nil {
 		return
@@ -747,6 +817,7 @@ func (r *ring) close() {
 		return
 	}
 	r.stopOnce.Do(func() { close(r.stop) })
+	r.loops.Wait()
 	if err := r.emitter.Close(); err != nil {
 		logger.Printf("ring: closing the trace: %s", err)
 	}
@@ -766,7 +837,7 @@ func (r *ring) reloaded(reloadErr error) bool {
 	if r == nil || r.emitter == nil {
 		return reloadErr == nil
 	}
-	material, ca, hashErr := ringMaterial(r.policyPath)
+	material, ca, hashErr := ringMaterial(r.loaded)
 	if hashErr != nil {
 		logger.Printf("ring: unable to hash the reloaded material: %s", hashErr)
 	}

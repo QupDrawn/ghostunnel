@@ -73,6 +73,25 @@ type ClientVerifier interface {
 	VerifyPeerCertificateServerFor(roots *x509.CertPool, now func() time.Time) func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error
 }
 
+// FileMaterialSource is a TLSConfigSource that can say which files the
+// material in use was loaded from: the certificate and ACME sources.
+type FileMaterialSource interface {
+	// LoadedFiles returns the files of the last successful load, exactly
+	// as that load read them, and true; or false when the material in use
+	// was not loaded from files by this package (a PKCS#11 module, a
+	// keychain).
+	LoadedFiles() (*LoadedFiles, bool)
+}
+
+// LoadedFilesOf is source's LoadedFiles, or false for a source that is not
+// a FileMaterialSource (the Workload API source).
+func LoadedFilesOf(source TLSConfigSource) (*LoadedFiles, bool) {
+	if files, ok := source.(FileMaterialSource); ok {
+		return files.LoadedFiles()
+	}
+	return nil, false
+}
+
 // ClientVerifyingSource is a TLSConfigSource that can hand the
 // verification of client chains to the tunnel's ClientVerifier: the
 // certificate and ACME sources. The Workload API source does not; it

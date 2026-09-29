@@ -518,8 +518,8 @@ reviewed; every other step runs on the Linux host, as root.
    /etc/ghostunnel/observers.env; chmod 0644`. The four observer units
    read it; `ghostunnel.service` does not. See "Two files, two sources".
 6. Units: `cp systemd/* /etc/systemd/system/ && systemctl daemon-reload`.
-7. Verify before starting: `./check-units.sh --all` (see "What was not
-   verified here"). The probe stages need the ring stopped; it is.
+7. Verify before starting: `./check-units.sh --all` (see "What `check-units.sh`
+   checks, and where"). The probe stages need the ring stopped; it is.
 8. `systemctl enable --now ghostunnel-ring.target`.
 
 ## Two files, two sources
@@ -600,6 +600,7 @@ tick numbers feed:
 | ghostunnel | `--ring-heartbeat-max-age` | `30s` | no default; `ring.go` refuses zero; must exceed super's `-cadence` |
 | ghostunnel | `--ring-tick` | not passed; default `5s` | how often the emitter writes a `tick` line to the trace; must be well below the members' `-cadence` (checked: below 10 s) |
 | all four observers | `-tick-max-age` | not passed; default `30s` | how old the newest `tick` may be before `tick-fresh` fails, and how far back `accept-loop` looks; the value in force (the default when absent) must be at least twice the `--ring-tick` in force and the same on all four members (checked, defaults included) |
+| all four observers | `-window` | `3` | how many heartbeat entries each owner keeps and every reader's chain test allows; the same on all four members (checked, the default when absent) |
 | tunnel; admin, material, super | `-lifetime-margin`, `-acl-grace`; `-tunnel-lifetime-margin`, `-tunnel-acl-grace` | not passed; defaults `2s`, `2s` | the three judges of the tunnel surface must run with the tunnel member's own values (checked, as spelled, defaults included) |
 | all four observers | `tick-fresh` (a check, fed by `-tick-max-age`) | | the newest `tick` of the current boot, or its start line before the first tick, is within `-tick-max-age` of the member's clock; each member judges it on its own and faults on it; an unreadable trace fails it too |
 | tunnel (computed by all four) | `accept-loop` (a check, fed by `-tick-max-age`) | | any `accept-error` line of the current boot within the last `-tick-max-age` fails it, subject the error text; the tunnel member publishes it and the other three compare what they compute with its fault (`surface-disagree`) |
@@ -802,6 +803,7 @@ future observer needs the network, drop the line for that unit only.
   `--ring-heartbeat-max-age` exceeds super's; any `--ring-tick` is below
   super's `-cadence`; every member's `-tick-max-age` in force (passed or
   default) is at least twice the tick in force and the same on all four;
+  every member's `-window` in force is the same on all four;
   admin, material and super's `-tunnel-lifetime-margin` /
   `-tunnel-acl-grace` equal tunnel's `-lifetime-margin` / `-acl-grace` (as
   spelled, absent meaning the default);
@@ -827,7 +829,7 @@ future observer needs the network, drop the line for that unit only.
 The other stages need the host; run them as root before the first start:
 
 ```
-./check-units.sh --verify      # systemd-analyze verify /etc/systemd/system/ghostunnel*.{service,target}
+./check-units.sh --verify      # cmp each unit in /etc/systemd/system with systemd/ (installed verbatim, so any difference fails, valid or not); systemd-analyze verify on each
 ./check-units.sh --tree        # stat -c %U:%G:%a on every tree.tsv directory and on every file under /etc/ghostunnel (the key ring.env names root:gt 0640, cert, CA and policy root:gtring-pem 0640, the env files and tree.tsv root:root 0644, any unnamed PEM root's with nothing for other); id -nG per user; /etc/ghostunnel/tree.tsv identical; /proc hidepid
 ./check-units.sh --probe       # setpriv as each user: forbidden writes denied (EACCES/EPERM), permitted ones succeed;
                                # then, on a scratch copy of the tree, a slot each user creates under another member's

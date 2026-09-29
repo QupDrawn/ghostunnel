@@ -113,6 +113,67 @@ func TestProcStartTimeReader(t *testing.T) {
 	}
 }
 
+// procStatWith writes <root>/stat as a kernel on a host with many
+// interrupts writes it: an intr line of intrBytes bytes ahead of btime.
+func procStatWith(t *testing.T, root string, intrBytes int, btime int64) {
+	t.Helper()
+	intr := []byte("intr 123456")
+	for len(intr) < intrBytes {
+		intr = append(intr, " 0"...)
+	}
+	stat := "cpu  1 2 3 4 5 6 7 8 9 10\n" + string(intr[:intrBytes]) + "\nctxt 100\nbtime " + strconv.FormatInt(btime, 10) + "\nprocesses 500\n"
+	if err := os.WriteFile(filepath.Join(root, "stat"), []byte(stat), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestProcBootTimeLongIntrLine: an intr line past bufio.Scanner's default
+// 64 KiB token, as a host with many interrupts carries, is read through to
+// btime; a line or a file past procStatMaxBytes fails closed rather than
+// passing on part of it.
+func TestProcBootTimeLongIntrLine(t *testing.T) {
+	btime := psAt(t, "2026-09-24T10:00:00Z").Unix()
+	root := procTable(t, 4242, "ghostunnel", 360050, btime)
+	procStatWith(t, root, 200<<10, btime)
+	if got, err := procBootTime(root); err != nil || got != btime {
+		t.Fatalf("an intr line of 200 KiB: btime %d, %v; want %d", got, err, btime)
+	}
+	psWant(t, proxyProcessAliveSubjects(4242, psAt(t, "2026-09-24T11:00:00Z"), procStartTime(root)))
+
+	procStatWith(t, root, procStatMaxBytes+1, btime)
+	if _, err := procBootTime(root); err == nil {
+		t.Fatal("an intr line past the bound was read")
+	}
+	psWant(t, proxyProcessAliveSubjects(4242, psAt(t, "2026-09-24T11:00:00Z"), procStartTime(root)), "pid:4242:unreadable")
+
+	// Short lines that together reach the bound before btime, and a btime
+	// line the bound cuts: both fail, neither yields a time.
+	var many []byte
+	for len(many) <= procStatMaxBytes {
+		many = append(many, "softirq 0 0 0 0 0 0 0 0 0 0 0\n"...)
+	}
+	if err := os.WriteFile(filepath.Join(root, "stat"), append(many, fmt.Sprintf("btime %d\n", btime)...), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := procBootTime(root); err == nil {
+		t.Fatal("a file past the bound before its btime line was read")
+	}
+	head := make([]byte, procStatMaxBytes-len("btime 17"))
+	for i := range head {
+		head[i] = ' '
+		if i%1024 == 1023 {
+			head[i] = '\n'
+		}
+	}
+	head[len(head)-1] = '\n'
+	if err := os.WriteFile(filepath.Join(root, "stat"), append(head, fmt.Sprintf("btime %d\n", btime)...), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := procBootTime(root); err == nil {
+		t.Fatalf("a btime line cut by the bound read as %d", got)
+	}
+}
+
 func TestProxyProcessAliveLiveProcess(t *testing.T) {
 	read := platformStartTime("/proc")
 	child := startCmdlineChild(t, "--keystore", "/etc/gt/keystore.p12")

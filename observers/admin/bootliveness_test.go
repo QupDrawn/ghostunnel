@@ -76,7 +76,7 @@ func blTable(t *testing.T, pids ...int) string {
 // blFind lists root now and judges that listing, as a cycle does with its
 // one listing of the trace root.
 func blFind(root string, live livenessProbe) []Finding {
-	return bootAmbiguousFindings(root, gtListRoot(root), live)
+	return bootAmbiguousFindings(root, gtListRoot(root), live, nil)
 }
 
 func blWant(t *testing.T, got []Finding, subject string) {
@@ -150,23 +150,63 @@ func blWantAll(t *testing.T, got []Finding, subjects ...string) {
 
 func TestBootStartPID(t *testing.T) {
 	root := blBoots(t, 4242)
-	pid, err := bootStartPID(root, "0000000001")
+	pid, err := bootStartPID(root, "0000000001", nil)
 	if err != nil || pid != 4242 {
 		t.Fatalf("pid %d, %v", pid, err)
 	}
 	// A torn first line, a line that is not a start line, and no first
 	// segment are all unreadable.
 	gtWriteSegment(t, root, "0000000002", "0000000001.trace", []byte(gtLines[0]))
-	if _, err := bootStartPID(root, "0000000002"); err == nil {
+	if _, err := bootStartPID(root, "0000000002", nil); err == nil {
 		t.Fatal("a torn start line read")
 	}
 	gtWriteSegment(t, root, "0000000003", "0000000001.trace", gtJoin(gtLines[1]))
-	if _, err := bootStartPID(root, "0000000003"); err == nil {
+	if _, err := bootStartPID(root, "0000000003", nil); err == nil {
 		t.Fatal("an accept line read as a start line")
 	}
 	gtWriteSegment(t, root, "0000000004", "0000000002.trace", gtJoin(gtLines[0]))
-	if _, err := bootStartPID(root, "0000000004"); err == nil {
+	if _, err := bootStartPID(root, "0000000004", nil); err == nil {
 		t.Fatal("a boot with no first segment read")
+	}
+}
+
+// The start lines are read every cycle and decoded once per content: an
+// unchanged line is judged from the memory, a line rewritten in place to
+// name another pid is decoded again and that pid is the one asked about,
+// and a boot gone from the listing is forgotten.
+func TestBootAmbiguousRemembersDecodesByContent(t *testing.T) {
+	root := blBoots(t, 4242, 4343)
+	mem := &contentMemo[startLineDecode]{}
+	decodes := gtCountDecodes(t)
+	asked := map[int64]int{}
+	live := func(pid int64) (bool, error) { asked[pid]++; return pid == 4343 || pid == 4444, nil }
+	blWant(t, bootAmbiguousFindings(root, gtListRoot(root), live, mem), "")
+	if *decodes != 2 || len(mem.entries) != 2 {
+		t.Fatalf("first look: %d decodes, %d remembered; want 2 and 2", *decodes, len(mem.entries))
+	}
+	*decodes = 0
+	blWant(t, bootAmbiguousFindings(root, gtListRoot(root), live, mem), "")
+	if *decodes != 0 || asked[4242] != 2 || asked[4343] != 2 {
+		t.Fatalf("unchanged: %d decodes, asked %v; want none and every pid asked again", *decodes, asked)
+	}
+	// Boot 1's start line now names a live pid, at the same length.
+	line := strings.Replace(gtLines[0], `"pid":4242`, `"pid":4444`, 1)
+	gtWriteSegment(t, root, "0000000001", "0000000001.trace", gtJoin(line))
+	blWant(t, bootAmbiguousFindings(root, gtListRoot(root), live, mem), "0000000001,0000000002")
+	if *decodes != 1 || asked[4444] != 1 {
+		t.Fatalf("rewritten: %d decodes, asked %v; want the one line decoded and its pid asked", *decodes, asked)
+	}
+	if len(mem.entries) != 2 {
+		t.Fatalf("%d decodes remembered, want the two lines listed now", len(mem.entries))
+	}
+	// A line that does not decode is remembered as not decoding.
+	gtWriteSegment(t, root, "0000000001", "0000000001.trace", gtJoin(gtLines[1]))
+	*decodes = 0
+	for i := 0; i < 2; i++ {
+		blWant(t, bootAmbiguousFindings(root, gtListRoot(root), live, mem), "0000000001,0000000002")
+	}
+	if *decodes != 1 {
+		t.Fatalf("a line that is not a start line decoded %d times over two looks, want once", *decodes)
 	}
 }
 

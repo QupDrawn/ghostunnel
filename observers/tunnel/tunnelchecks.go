@@ -231,8 +231,7 @@ func (c TunnelChecks) Run(cfg *Config, st *State, peers map[string]PeerView) []F
 	case !readable:
 		out = c.allFail(gtBootName(boot.Number))
 	default:
-		out = tunnelSurfaceFindings(boot, cfg.Now, c.LifetimeMargin, c.ACLGrace, c.TickMaxAge)
-		out = append(out, substanceFindings(boot, substanceJudgeFor(cfg, st))...)
+		out = tunnelFindings(boot, cfg.Now, c.margins(), substanceJudgeFor(cfg, st))
 		start := boot.Records[0].Start
 		if c.ExpectListen != "" && start.Config.Listen != c.ExpectListen {
 			out = append(out, Finding{Check: checkListenerExpected, Subject: start.Config.Listen})
@@ -254,11 +253,11 @@ func (c TunnelChecks) Run(cfg *Config, st *State, peers map[string]PeerView) []F
 	}
 	if err != nil {
 		out = append(out, traceConsistentUnread()...)
-		out = append(out, bootAmbiguousFindings(cfg.TracesRoot, listing, live)...)
+		out = append(out, bootAmbiguousFindings(cfg.TracesRoot, listing, live, startLineMemo(st))...)
 	} else {
 		previous := st.TraceBoot
 		out = append(out, traceConsistentFindings(st, boot)...)
-		out = append(out, bootAmbiguousFindings(cfg.TracesRoot, listing, live)...)
+		out = append(out, bootAmbiguousFindings(cfg.TracesRoot, listing, live, startLineMemo(st))...)
 		out = append(out, bootEndedFindings(st, cfg.TracesRoot, previous, boot, cfg.Now, c.TickMaxAge)...)
 	}
 	out = append(out, surfaceDisagreements(surfaceTunnel, boot, readable, cfg.Now, c.margins(), substanceJudgeFor(cfg, st), peers)...)

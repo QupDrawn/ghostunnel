@@ -22,10 +22,14 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"fmt"
+	"sync/atomic"
 )
 
 type keystoreCertificate struct {
 	baseCertificate
+	// loaded is the files of the last successful load, stored with the
+	// certificate and trust store parsed from them.
+	loaded atomic.Pointer[LoadedFiles]
 	// Keystore or PEM files path
 	keystorePaths []string
 	// Password for keystore (may be empty)
@@ -68,12 +72,18 @@ func CertificateFromKeystore(keystorePath, keystorePassword, caBundlePath string
 // Reload transparently reloads the certificate.
 func (c *keystoreCertificate) Reload() error {
 	var pemBlocks []*pem.Block
-	for _, path := range c.keystorePaths {
-		blocks, err := readCertificateFile(path, c.keystorePassword, c.format)
+	loaded := &LoadedFiles{CABundlePath: c.caBundlePath}
+	for i, path := range c.keystorePaths {
+		blocks, data, err := readCertificateFile(path, c.keystorePassword, c.format)
 		if err != nil {
 			return fmt.Errorf("reading certificate file %q: %w", path, err)
 		}
 		pemBlocks = append(pemBlocks, blocks...)
+		// The first of the PEM files is the certificate; a keystore holds
+		// the key as well and is not kept.
+		if i == 0 && c.format == "PEM" {
+			loaded.CertificatePath, loaded.Certificate = path, data
+		}
 	}
 
 	var pemBytes []byte
@@ -91,13 +101,19 @@ func (c *keystoreCertificate) Reload() error {
 		return fmt.Errorf("parsing leaf certificate: %w", err)
 	}
 
-	bundle, err := LoadTrustStore(c.caBundlePath)
+	bundle, caBytes, err := loadTrustStore(c.caBundlePath)
 	if err != nil {
 		return fmt.Errorf("loading trust store: %w", err)
 	}
+	loaded.CABundle = caBytes
 
 	c.cachedCertificate.Store(&certAndKey)
 	c.cachedCertPool.Store(bundle)
+	c.loaded.Store(loaded)
 
 	return nil
+}
+
+func (c *keystoreCertificate) loadedFiles() *LoadedFiles {
+	return c.loaded.Load()
 }

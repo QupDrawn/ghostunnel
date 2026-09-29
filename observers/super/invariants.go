@@ -63,8 +63,9 @@ func (r *reader) checkI5() {
 	}
 	sort.Strings(keys)
 	for _, k := range keys {
-		data, err := r.read(filepath.Join(r.cfg.StoresRoot, filepath.FromSlash(k)))
-		if err != nil || sha256Hex(data) != r.st.Memory[k] {
+		disk := filepath.Join(r.cfg.StoresRoot, filepath.FromSlash(k))
+		data, err := r.read(disk)
+		if err != nil || r.hashOf(disk, data) != r.st.Memory[k] {
 			r.fail("I5", k)
 		}
 	}

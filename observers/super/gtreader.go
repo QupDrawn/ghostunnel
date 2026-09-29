@@ -39,6 +39,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -68,7 +69,7 @@ var (
 	gtReBootName    = regexp.MustCompile(`^[0-9]{10}$`)
 	gtReSegmentName = regexp.MustCompile(`^[0-9]{10}\.trace$`)
 	gtReHash        = regexp.MustCompile(`^[0-9a-f]{64}$`)
-	gtReInteger     = regexp.MustCompile(`^-?(0|[1-9][0-9]*)$`)
+	gtReInteger     = regexp.MustCompile(`^-?(0|[1-9][0-9]*)$`) // the spelling gtIsInteger matches
 )
 
 // The ten kinds, in the order the README lists them (the emitter's
@@ -96,6 +97,32 @@ var (
 	gtBinaryKeys   = []string{"path", "sha256"}
 	gtPeerKeys     = []string{"subject", "issuer", "serial", "sans", "fingerprint"}
 )
+
+// Built once from the lists above and only ever read: each kind's marker
+// in gtKinds order, each kind's full key set (the header keys, then the
+// body's), and a handshake's with its one optional key, chain, after them.
+var (
+	gtKindMarkers        = gtMarkersOf(gtKinds)
+	gtKindKeys           = gtKeysOf(gtKinds)
+	gtHandshakeChainKeys = append(append([]string{}, gtKindKeys["handshake"]...), "chain")
+)
+
+func gtMarkersOf(kinds []string) [][]byte {
+	out := make([][]byte, len(kinds))
+	for i, k := range kinds {
+		out[i] = []byte(`{"kind":"` + k + `",`)
+	}
+	return out
+}
+
+func gtKeysOf(kinds []string) map[string][]string {
+	out := make(map[string][]string, len(kinds))
+	for _, k := range kinds {
+		keys := append(append([]string{}, gtHeaderKeys...), gtBodyKeys[k]...)
+		out[k] = keys[:len(keys):len(keys)]
+	}
+	return out
+}
 
 // The closed enumerations (README 1.1, 1.2).
 var (
@@ -173,7 +200,22 @@ type gtBoot struct {
 	Number int64
 	Root   string // the trace root it was read from, where gt/chains/ is
 
-	Records  []gtRecord  // every complete line, in sequence order
+	// Records are every complete line, in sequence order. They are only
+	// ever read: the slice, or the leading part of it, may be the decode
+	// memory's own (gtDecodedSegment.Records), handed to the next read.
+	Records []gtRecord
+	// Carried is how many of the leading Records this read took from the
+	// decode memory unchanged: Records[:Carried] were decoded by an earlier
+	// read from bytes that hash the same now, from the same reader state,
+	// and Records[Carried:] were decoded by this one. 0 for a read with no
+	// memory, or one whose first segment did not match it.
+	Carried int
+	// Memory and Read say which read of which memory this is: the memory
+	// the read resumed from (nil for none) and its count of reads when
+	// this one began (gtDecodeMemory.Reads). The earlier read Carried
+	// speaks of is that memory's read numbered Read-1, the one before.
+	Memory   *gtDecodeMemory
+	Read     uint64
 	Segments []gtSegment // each segment read, in order, with its complete-line prefix
 	Torn     bool        // the last segment ends in a line without a line feed
 }
@@ -211,6 +253,10 @@ type gtSegment struct {
 type gtDecodeMemory struct {
 	Boot     int64
 	Segments map[string]*gtDecodedSegment
+	// Reads counts the reads made with the memory, failed ones included,
+	// so that a judgement kept of one read (judgememory.go) can tell the
+	// read after it from any later one.
+	Reads uint64
 }
 
 // gtDecodedSegment is one segment of the memory.
@@ -224,8 +270,10 @@ type gtDecodedSegment struct {
 	// from, and Hash the SHA-256 of exactly those bytes.
 	Length int64
 	Hash   string
-	// Records are the lines of those bytes, decoded. The slice is never
-	// appended to in place; a reader copies it.
+	// Records are the lines of those bytes, decoded. The slice is stored
+	// capped (cap == len), so that an append to it, by the boot it is
+	// handed to or by anyone, copies rather than writes into the memory;
+	// and it is never written to in place.
 	Records []gtRecord
 	// Next and LastAt are the reader's state after the last record.
 	Next   int64
@@ -481,15 +529,19 @@ var gtDecode = gtDecodeLine
 // from mem where its key matches (nil decodes everything). On success mem
 // holds this read; on any error it holds nothing.
 func gtReadBoot(root string, n int64, mem *gtDecodeMemory) (*gtBoot, error) {
-	if mem != nil && (mem.Boot != n || mem.Segments == nil) {
-		mem.Boot = n
-		mem.Segments = map[string]*gtDecodedSegment{}
+	if mem != nil {
+		mem.Reads++
+		if mem.Boot != n || mem.Segments == nil {
+			mem.Boot = n
+			mem.Segments = map[string]*gtDecodedSegment{}
+		}
 	}
 	b, err := gtReadBootWith(root, n, mem)
 	if mem != nil {
 		if err != nil {
 			mem.Segments = map[string]*gtDecodedSegment{}
 		} else {
+			b.Memory, b.Read = mem, mem.Reads
 			// Forget segments that are not on the disk now; the
 			// present ones were replaced by this read.
 			for name := range mem.Segments {
@@ -543,8 +595,15 @@ func gtReadBootWith(root string, n int64, mem *gtDecodeMemory) (*gtBoot, error) 
 			return nil, &gtError{Rel: segRel, Reason: fmt.Sprintf("segment is named %d but the next sequence is %d", got, next)}
 		}
 		// The segment rule: data is the segment's content, never the
-		// whole of a pre-extended file.
-		data, err := gtReadSegment(filepath.Join(dir, name))
+		// whole of a pre-extended file. The memory's length for the
+		// segment sizes the read's buffer and nothing else.
+		var hint int64
+		if mem != nil {
+			if c := mem.Segments[name]; c != nil {
+				hint = c.Length
+			}
+		}
+		data, err := gtReadSegment(filepath.Join(dir, name), hint)
 		if err != nil {
 			return nil, &gtError{Rel: segRel, Reason: err.Error()}
 		}
@@ -596,8 +655,21 @@ func gtReadBootWith(root string, n int64, mem *gtDecodeMemory) (*gtBoot, error) 
 		}
 		startNext, startAt := next, lastAt
 		first := len(b.Records)
+		if cand != nil && first == 0 && len(lines) == 0 {
+			// The boot so far is this segment, and all of it is the
+			// memory's: its records are the memory's own slice, which is
+			// capped, so that any append to it copies.
+			b.Records = cand.Records
+		} else {
+			b.Records = slices.Grow(b.Records, reused+len(lines))
+			if cand != nil {
+				b.Records = append(b.Records, cand.Records...)
+			}
+		}
 		if cand != nil {
-			b.Records = append(b.Records, cand.Records...)
+			if b.Carried == first {
+				b.Carried += reused
+			}
 			next, lastAt = cand.Next, cand.LastAt
 		}
 		for j, line := range lines {
@@ -636,7 +708,10 @@ func gtReadBootWith(root string, n int64, mem *gtDecodeMemory) (*gtBoot, error) 
 		if mem != nil {
 			// Remember this segment as decoded this time. The records are
 			// the boot's own slice, capped so that an append to either
-			// copies rather than writes into the other.
+			// copies rather than writes into the other: the next read hands
+			// this very slice to its boot when nothing in the segment is
+			// new. Every reader of a boot's records, &boot.Records[i]
+			// included, only reads them (gtBoot.Records).
 			end := len(b.Records)
 			mem.Segments[name] = &gtDecodedSegment{
 				StartNext: startNext, StartAt: startAt,
@@ -651,35 +726,53 @@ func gtReadBootWith(root string, n int64, mem *gtDecodeMemory) (*gtBoot, error) 
 
 // gtReadSegment returns the content of the segment at p by the segment
 // rule: its bytes before the first NUL, or all of them when it has none.
-// The file is read in chunks of at most gtReadChunkBytes from its start;
-// the read ends in the chunk that holds the first NUL, with the content
-// cut there, or at end of file. A segment pre-extended to its maximum size
-// is therefore never read whole. The open and every read go through
-// readRetrying as one operation: on Windows a sharing violation on the
-// open or on any chunk repeats the whole read from a fresh open within the
+// The file is read from its start straight into the buffer the content is
+// returned in, at most gtReadChunkBytes per read; the read ends in the
+// chunk that holds the first NUL, with the content cut there, or at end of
+// file. A segment pre-extended to its maximum size is therefore never read
+// whole. hint is a content length this reader read of the segment before
+// (the decode memory's Length), never a file size: the buffer is sized to
+// it, clamped to gtMaxSegmentBytes, and one chunk more, so that a segment
+// read again after a few more lines landed is read with no growth. A wrong
+// hint changes only the allocation. The open (openRegular: a named pipe is
+// refused, never waited on) and every read go through readRetrying as one
+// operation: on Windows a sharing violation on the open or on any chunk
+// repeats the whole read from a fresh open, at length 0, within the
 // budget, so that the content comes from one open and never from two
 // spliced together; after the budget the error is the segment's.
-func gtReadSegment(p string) ([]byte, error) {
+func gtReadSegment(p string, hint int64) ([]byte, error) {
+	if hint < 0 {
+		hint = 0
+	}
+	if hint > gtMaxSegmentBytes {
+		hint = gtMaxSegmentBytes
+	}
 	var content []byte
 	err := readRetrying(func() error {
-		f, err := os.Open(p)
+		f, _, err := openRegular(p, nil)
 		if err != nil {
 			return err
 		}
 		defer f.Close()
-		content = nil
-		buf := make([]byte, gtReadChunkBytes)
+		content = make([]byte, 0, hint+gtReadChunkBytes)
 		for {
-			n, err := f.Read(buf)
+			if len(content) == cap(content) {
+				content = gtGrowSegment(content)
+			}
+			room := content[len(content):cap(content)]
+			if len(room) > gtReadChunkBytes {
+				room = room[:gtReadChunkBytes]
+			}
+			n, err := f.Read(room)
 			if n > 0 {
-				if i := bytes.IndexByte(buf[:n], 0); i >= 0 {
-					content = append(content, buf[:i]...)
+				if i := bytes.IndexByte(room[:n], 0); i >= 0 {
+					content = content[:len(content)+i]
 					return nil
 				}
 				if len(content)+n > gtMaxSegmentBytes {
 					return fmt.Errorf("segment content exceeds %d bytes", gtMaxSegmentBytes)
 				}
-				content = append(content, buf[:n]...)
+				content = content[:len(content)+n]
 			}
 			if err == io.EOF {
 				return nil
@@ -693,6 +786,22 @@ func gtReadSegment(p string) ([]byte, error) {
 		return nil, err
 	}
 	return content, nil
+}
+
+// gtGrowSegment returns content with room for at least one more chunk: the
+// capacity doubled, and never past gtMaxSegmentBytes and one chunk, which
+// is all the read can use before it refuses the segment.
+func gtGrowSegment(content []byte) []byte {
+	want := 2 * cap(content)
+	if want < len(content)+gtReadChunkBytes {
+		want = len(content) + gtReadChunkBytes
+	}
+	if limit := gtMaxSegmentBytes + gtReadChunkBytes; want > limit {
+		want = limit
+	}
+	grown := make([]byte, len(content), want)
+	copy(grown, content)
+	return grown
 }
 
 // gtSums is one SHA-256 pass over b with a sum taken at each length in at
@@ -742,8 +851,8 @@ func gtSplitLines(data []byte) ([][]byte, bool) {
 // do not begin with a marker. The marker is exactly {"kind":"<kind>", with
 // no whitespace; classification reads no further (README 1.1).
 func gtClassify(line []byte) string {
-	for _, k := range gtKinds {
-		if bytes.HasPrefix(line, []byte(`{"kind":"`+k+`",`)) {
+	for i, k := range gtKinds {
+		if bytes.HasPrefix(line, gtKindMarkers[i]) {
 			return k
 		}
 	}
@@ -767,11 +876,11 @@ func gtDecodeLine(line []byte) (gtRecord, error) {
 	if err != nil {
 		return gtRecord{}, err
 	}
-	keys := append(append([]string{}, gtHeaderKeys...), gtBodyKeys[kind]...)
+	keys := gtKindKeys[kind]
 	if kind == "handshake" && obj.has("chain") {
 		// The one optional key: a handshake names the presented chain
 		// under gt/chains/ when the client presented a certificate.
-		keys = append(keys, "chain")
+		keys = gtHandshakeChainKeys
 	}
 	if err := obj.exactly(keys); err != nil {
 		return gtRecord{}, err
@@ -1188,14 +1297,53 @@ func (o *gtObject) isNull(k string) bool { return bytes.Equal(o.raw(k), []byte("
 // int is a JSON integer: digits only, never a float, a string or null.
 func (o *gtObject) int(k string) (int64, error) {
 	raw := o.raw(k)
-	if !gtReInteger.Match(raw) {
+	if !gtIsInteger(raw) {
 		return 0, fmt.Errorf("%s: not an integer", k)
+	}
+	// Eighteen bytes, a sign included, cannot overflow an int64; a longer
+	// integer is left to strconv, which refuses one that does.
+	if len(raw) <= 18 {
+		neg := raw[0] == '-'
+		digits := raw
+		if neg {
+			digits = raw[1:]
+		}
+		var n int64
+		for _, c := range digits {
+			n = n*10 + int64(c-'0')
+		}
+		if neg {
+			n = -n
+		}
+		return n, nil
 	}
 	n, err := strconv.ParseInt(string(raw), 10, 64)
 	if err != nil {
 		return 0, fmt.Errorf("%s: %v", k, err)
 	}
 	return n, nil
+}
+
+// gtIsInteger reports whether raw is a JSON integer as gtReInteger spells
+// it, ^-?(0|[1-9][0-9]*)$: an optional minus, then 0 alone or a digit
+// other than 0 followed by digits, and nothing else.
+func gtIsInteger(raw []byte) bool {
+	i := 0
+	if i < len(raw) && raw[i] == '-' {
+		i++
+	}
+	if i == len(raw) {
+		return false
+	}
+	if raw[i] == '0' {
+		return i+1 == len(raw)
+	}
+	for ; i < len(raw); i++ {
+		if raw[i] < '0' || raw[i] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // conn is the connection id every connection line carries, at least 1.
@@ -1212,18 +1360,58 @@ func (o *gtObject) conn() (int64, error) {
 
 // str is a JSON string that carries no PEM header (README 1.1).
 func (o *gtObject) str(k string) (string, error) {
-	raw := o.raw(k)
+	return gtStr(o.raw(k), k)
+}
+
+// gtStr is str over one raw value. A value that is a quote, bytes with no
+// backslash, no quote and no control byte that are valid UTF-8, and a
+// quote, decodes to exactly those bytes, which is what json.Unmarshal
+// gives for it; they are taken directly. Every other value is decoded by
+// json.Unmarshal.
+func gtStr(raw []byte, k string) (string, error) {
 	if len(raw) == 0 || raw[0] != '"' {
 		return "", fmt.Errorf("%s: not a string", k)
 	}
-	var s string
-	if err := json.Unmarshal(raw, &s); err != nil {
-		return "", fmt.Errorf("%s: not a string", k)
+	s, ok := gtPlainString(raw)
+	if !ok {
+		var err error
+		if s, err = gtUnmarshalString(raw); err != nil {
+			return "", fmt.Errorf("%s: not a string", k)
+		}
 	}
 	if strings.Contains(s, "-----BEGIN") {
 		return "", fmt.Errorf("%s: carries a PEM block", k)
 	}
 	return s, nil
+}
+
+// gtUnmarshalString is json.Unmarshal of raw into a string. It is a
+// function of its own so that the string json.Unmarshal is handed the
+// address of is not gtStr's, which then stays off the heap.
+func gtUnmarshalString(raw []byte) (string, error) {
+	var s string
+	err := json.Unmarshal(raw, &s)
+	return s, err
+}
+
+// gtPlainString returns the bytes between the quotes of raw, as a string,
+// when raw is a JSON string that needs no decoding: nothing but those
+// bytes between two quotes, none of them a backslash, a quote or a control
+// byte (below 0x20), and all of them valid UTF-8.
+func gtPlainString(raw []byte) (string, bool) {
+	if len(raw) < 2 || raw[0] != '"' || raw[len(raw)-1] != '"' {
+		return "", false
+	}
+	inner := raw[1 : len(raw)-1]
+	for _, c := range inner {
+		if c == '\\' || c == '"' || c < 0x20 {
+			return "", false
+		}
+	}
+	if !utf8.Valid(inner) {
+		return "", false
+	}
+	return string(inner), true
 }
 
 func (o *gtObject) nonEmpty(k string) (string, error) {
@@ -1317,8 +1505,7 @@ func (o *gtObject) strings(k string) ([]string, error) {
 	}
 	out := make([]string, 0, len(items))
 	for i, it := range items {
-		el := &gtObject{order: []string{"x"}, vals: map[string]json.RawMessage{"x": it}}
-		s, err := el.str("x")
+		s, err := gtStr(bytes.TrimSpace(it), "x")
 		if err != nil {
 			return nil, fmt.Errorf("%s[%d]: not a string", k, i)
 		}

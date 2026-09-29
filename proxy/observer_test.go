@@ -8,6 +8,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -332,4 +333,119 @@ func TestObserverSeesAcceptErrors(t *testing.T) {
 	if calls := ln.count(); len(reported) > calls {
 		t.Fatalf("%d reports for %d Accept calls: at most one per failed Accept", len(reported), calls)
 	}
+}
+
+// slowCloseObserver takes its time in Closed and records when it has
+// returned.
+type slowCloseObserver struct {
+	*recordingObserver
+	delay    time.Duration
+	returned atomic.Bool
+}
+
+func (o *slowCloseObserver) Accepted(conn net.Conn) (ConnObserver, error) {
+	if _, err := o.recordingObserver.Accepted(conn); err != nil {
+		return nil, err
+	}
+	return o, nil
+}
+
+func (o *slowCloseObserver) Closed(reason CloseReason) {
+	time.Sleep(o.delay)
+	o.recordingObserver.Closed(reason)
+	o.returned.Store(true)
+}
+
+// TestWaitReturnsOnlyAfterClosed: Wait does not return while an
+// observer's Closed is still running for a connection that drained during
+// shutdown, so whatever Closed records is recorded before the caller of
+// Wait goes on (ghostunnel closes its trace there).
+func TestWaitReturnsOnlyAfterClosed(t *testing.T) {
+	target, err := net.Listen("tcp", "127.0.0.1:0")
+	assert.Nil(t, err)
+	defer target.Close()
+	dialer := func(ctx context.Context) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, "tcp", target.Addr().String())
+	}
+	obs := &slowCloseObserver{recordingObserver: newRecordingObserver(), delay: 300 * time.Millisecond}
+	p, incoming := observedProxy(t, dialer, 0, obs)
+	defer p.Shutdown()
+
+	src, err := net.Dial("tcp", incoming.Addr().String())
+	assert.Nil(t, err)
+	dst, err := target.Accept()
+	assert.Nil(t, err)
+	_, _ = src.Write([]byte("A"))
+	_, err = dst.Read(make([]byte, 1))
+	assert.Nil(t, err)
+
+	// Shut down with the connection in flight, then let it drain.
+	p.Shutdown()
+	src.Close()
+	dst.Close()
+	p.Wait()
+	assert.True(t, obs.returned.Load(), "Wait returned before the observer's Closed had returned")
+}
+
+// stateTamperingObserver blanks the negotiated protocol in the state it is
+// handed at the handshake.
+type stateTamperingObserver struct {
+	*recordingObserver
+}
+
+func (o stateTamperingObserver) Accepted(conn net.Conn) (ConnObserver, error) {
+	if _, err := o.recordingObserver.Accepted(conn); err != nil {
+		return nil, err
+	}
+	return o, nil
+}
+
+func (o stateTamperingObserver) Handshake(state *tls.ConnectionState, err error) {
+	state.NegotiatedProtocol = ""
+}
+
+// TestObserverCannotAlterTheStateTheProxyActsOn: the state the observer is
+// handed at the handshake is its own copy. An observer that rewrites it
+// does not change what the proxy decides from the state: an ACME
+// TLS-ALPN-01 probe is still refused and never dialed.
+func TestObserverCannotAlterTheStateTheProxyActsOn(t *testing.T) {
+	cert, _ := selfSignedCert(t)
+	rawIncoming, err := net.Listen("tcp", "127.0.0.1:0")
+	assert.Nil(t, err)
+	incoming := tls.NewListener(rawIncoming, &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		NextProtos:   []string{"acme-tls/1"},
+		MinVersion:   tls.VersionTLS12,
+	})
+	dialed := make(chan struct{}, 1)
+	dialer := func(ctx context.Context) (net.Conn, error) {
+		dialed <- struct{}{}
+		return nil, errors.New("must not be reached")
+	}
+	obs := stateTamperingObserver{newRecordingObserver()}
+	p := New(incoming, 5*time.Second, 200*time.Millisecond, 0, 1, dialer, &testLogger{}, LogEverything, ProxyProtocolOff, nil)
+	p.Observer = obs
+	go p.Accept()
+	defer p.Shutdown()
+
+	client, err := tls.Dial("tcp", incoming.Addr().String(), &tls.Config{
+		InsecureSkipVerify: true,
+		NextProtos:         []string{"acme-tls/1"},
+		MinVersion:         tls.VersionTLS12,
+	})
+	assert.Nil(t, err)
+	if err == nil {
+		defer client.Close()
+	}
+
+	assert.Equal(t, CloseRefused, obs.awaitClose(t))
+	select {
+	case <-dialed:
+		t.Fatal("an ACME probe must not be dialed, whatever the observer did to its state")
+	default:
+	}
+	obs.mu.Lock()
+	defer obs.mu.Unlock()
+	assert.Empty(t, obs.dialed, "Dialed is never reached for an ACME probe")
 }

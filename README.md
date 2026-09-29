@@ -17,19 +17,21 @@ at the same commit, both proxies driven by the same client against the same
 echo on another host, 333 rounds of 300 connections each.
 
 With the warm backend pool the fork keeps by default, the record's sync
-overlaps the backend dial and the fork comes out ahead on every line:
+overlaps the backend dial and the fork comes out ahead on every line but
+bulk and the two tails sixteen at once, which hold level:
 
 ![bench: fork against base with the warm backend pool](pics/1.png)
 
 With the pool off (`--warm-backend-connections 0`), the fork pays its sync in
-full and still holds level with base:
+full, holds level with base one connection at a time, and still comes out
+ahead sixteen at once:
 
 ![bench: fork against base without the warm backend pool](pics/2.png)
 
 The lead depends on how far away the backend is. The pool hides the dial,
 so the longer the dial, the more it hides. Both runs above cross a zone
 boundary. With the echo in the bench host's own zone, over 33 rounds, the
-fork serves connections one at a time about 12% faster, and sixteen at
+fork serves connections one at a time about 9% faster, and sixteen at
 once about 3% faster.
 
 `bench/README.md` says how to run it and what the host needs.
@@ -67,8 +69,8 @@ a delivered halt in any `halts/`, or a coordinator heartbeat that is
 missing, malformed, stopped, or more than `--ring-heartbeat-max-age` from
 its clock in either direction refuses the connection. The read happens on
 every accept, from a standing decision refreshed on every change the
-kernel reports and by a full scan every second (`ringtrace/README.md`,
-section 3).
+kernel reports to what the gate reads and by a full scan every second
+(`ringtrace/README.md`, section 3).
 
 **Halt on any fault, recovery by unanimity.** A member whose check fails
 writes a halt in its own store and a slot in every other member's `halts/`;
@@ -131,9 +133,9 @@ ring declares.
   `halt`, `fault` and `halts/` and the coordinator's newest heartbeat, and
   refuses on the first failure; `ring.Accepted` calls it on every accept
   through a `GateState` whose standing decision is dropped on any change the
-  kernel reports on the tree, and re-scanned every second regardless
-  (`ring.watch`). A serve decision is never reused past the heartbeat's
-  window: its age is judged by the clock on every reuse.
+  kernel reports to what the gate reads, and re-scanned every second
+  regardless (`ring.watch`). A serve decision is never reused past the
+  heartbeat's window: its age is judged by the clock on every reuse.
 - **A fault at any member stops the proxy within that member's cycle plus
   the watch interval.** The member writes its halt and slots at the end of
   the cycle that found the fault (SPEC 12.1); the next accept sees the slot

@@ -11,9 +11,12 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"math"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -1048,7 +1051,7 @@ func TestGTPreExtendedSegmentContentSpansChunks(t *testing.T) {
 	}
 	size := 3 * gtReadChunkBytes
 	gtWriteSegment(t, root, "0000000001", "0000000001.trace", gtPreExtended(t, content, size))
-	data, err := gtReadSegment(filepath.Join(root, "0000000001", "0000000001.trace"))
+	data, err := gtReadSegment(filepath.Join(root, "0000000001", "0000000001.trace"), 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1064,7 +1067,7 @@ func TestGTPreExtendedSegmentContentSpansChunks(t *testing.T) {
 	}
 	// A NUL exactly on a chunk boundary: the content is the first chunk.
 	gtWriteSegment(t, root, "0000000001", "0000000001.trace", gtPreExtended(t, content[:gtReadChunkBytes], size))
-	data, err = gtReadSegment(filepath.Join(root, "0000000001", "0000000001.trace"))
+	data, err = gtReadSegment(filepath.Join(root, "0000000001", "0000000001.trace"), 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1225,7 +1228,7 @@ func TestGTReadSegmentBoundsContent(t *testing.T) {
 	if err := os.WriteFile(p, full, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	got, err := gtReadSegment(p)
+	got, err := gtReadSegment(p, 0)
 	if err != nil || len(got) != gtMaxSegmentBytes {
 		t.Fatalf("content of exactly the bound: %d bytes, %v", len(got), err)
 	}
@@ -1233,7 +1236,297 @@ func TestGTReadSegmentBoundsContent(t *testing.T) {
 	if err := os.WriteFile(over, append(full, 'x'), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := gtReadSegment(over); err == nil || !strings.Contains(err.Error(), "exceeds") {
+	if _, err := gtReadSegment(over, 0); err == nil || !strings.Contains(err.Error(), "exceeds") {
 		t.Fatalf("content past the bound read: %v", err)
+	}
+}
+
+// ---- the read's buffer: sized from the memory, never trusted -------------
+
+// gtReadEvery reads the segment at p under every hint a reader could hold
+// for it, from none to past the bound, and fails unless each read returns
+// want, or fails with wantErr in its message when want is nil.
+func gtReadEvery(t *testing.T, p string, want []byte, wantErr string) {
+	t.Helper()
+	n := int64(len(want))
+	for _, hint := range []int64{-1, 0, 1, n / 2, n - 1, n, n + 1, 10*n + 7, gtReadChunkBytes, gtMaxSegmentBytes - 1, gtMaxSegmentBytes, gtMaxSegmentBytes + 1, 1 << 40, math.MaxInt64} {
+		got, err := gtReadSegment(p, hint)
+		if want == nil {
+			if err == nil || !strings.Contains(err.Error(), wantErr) {
+				t.Fatalf("hint %d: read %d bytes, %v; want an error with %q", hint, len(got), err, wantErr)
+			}
+			continue
+		}
+		if err != nil || !bytes.Equal(got, want) {
+			t.Fatalf("hint %d: read %d bytes, %v; want the %d bytes of content", hint, len(got), err, len(want))
+		}
+	}
+}
+
+// TestGTReadSegmentHintLargerThanContent: the segment the memory remembers
+// replaced by a shorter one, exact or pre-extended. The hint is larger
+// than the content, and the read is the content, cut at the first NUL as
+// always; through the memory the read is what a read with none returns.
+func TestGTReadSegmentHintLargerThanContent(t *testing.T) {
+	root := t.TempDir()
+	end := time.Date(2026, 9, 24, 12, 0, 0, 0, time.UTC)
+	long := gtSynthLines(3000, end)
+	p := filepath.Join(root, "0000000001", "0000000001.trace")
+	mem := &gtDecodeMemory{}
+	gtWriteSegment(t, root, "0000000001", "0000000001.trace", gtJoin(long...))
+	gtSameRead(t, root, mem)
+	remembered := mem.Segments["0000000001.trace"].Length
+
+	short := gtJoin(gtLines[:4]...)
+	gtWriteSegment(t, root, "0000000001", "0000000001.trace", short)
+	if got, err := gtReadSegment(p, remembered); err != nil || !bytes.Equal(got, short) {
+		t.Fatalf("hint %d over a %d-byte segment: %d bytes, %v", remembered, len(short), len(got), err)
+	}
+	gtReadEvery(t, p, short, "")
+	b, _ := gtSameRead(t, root, mem)
+	if len(b.Records) != 4 || b.Carried != 0 {
+		t.Fatalf("the shorter segment: %d records, %d carried; want 4 and 0", len(b.Records), b.Carried)
+	}
+
+	// Shorter content in a pre-extended file of the old length: the NUL
+	// cut stands whatever the hint.
+	gtWriteSegment(t, root, "0000000001", "0000000001.trace", gtJoin(long...))
+	gtSameRead(t, root, mem)
+	pre := gtPreExtended(t, short, len(gtJoin(long...)))
+	gtWriteSegment(t, root, "0000000001", "0000000001.trace", pre)
+	gtReadEvery(t, p, short, "")
+	if b, _ := gtSameRead(t, root, mem); len(b.Records) != 4 || b.Torn {
+		t.Fatalf("the shorter pre-extended segment: %d records torn=%v", len(b.Records), b.Torn)
+	}
+	// Longer than any hint the memory held: read whole, past a chunk.
+	longer := gtJoin(gtSynthLines(14000, end)...)
+	if len(longer) <= int(remembered)+gtReadChunkBytes {
+		t.Fatalf("test content of %d bytes is not past the hint and a chunk", len(longer))
+	}
+	gtWriteSegment(t, root, "0000000001", "0000000001.trace", longer)
+	gtReadEvery(t, p, longer, "")
+}
+
+// TestGTReadSegmentHintAboveBound: a hint above gtMaxSegmentBytes, or any
+// hint at all, neither lifts the bound nor reads past a NUL: content of
+// exactly the bound reads whole, one byte more is refused, and a NUL cuts.
+func TestGTReadSegmentHintAboveBound(t *testing.T) {
+	root := t.TempDir()
+	full := bytes.Repeat([]byte{'x'}, gtMaxSegmentBytes)
+	p := filepath.Join(root, "full.trace")
+	if err := os.WriteFile(p, full, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, hint := range []int64{gtMaxSegmentBytes + 1, 2 * gtMaxSegmentBytes, math.MaxInt64} {
+		if got, err := gtReadSegment(p, hint); err != nil || len(got) != gtMaxSegmentBytes {
+			t.Fatalf("hint %d, content of exactly the bound: %d bytes, %v", hint, len(got), err)
+		}
+	}
+	over := filepath.Join(root, "over.trace")
+	if err := os.WriteFile(over, append(full, 'x'), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gtReadEvery(t, over, nil, "exceeds")
+	cut := append(append([]byte{}, full[:gtReadChunkBytes+17]...), 0, 'y')
+	nul := filepath.Join(root, "nul.trace")
+	if err := os.WriteFile(nul, cut, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gtReadEvery(t, nul, full[:gtReadChunkBytes+17], "")
+}
+
+// ---- the memory's records: handed on, never written through --------------
+
+// A boot read from the memory alone is the memory's own records, capped:
+// cap == len, so that an append to the boot's records copies. Every
+// segment the memory holds is capped the same way, and a boot read with a
+// segment replaced leaves the previous read's records as they were.
+func TestGTDecodeMemoryRecordsAreCapped(t *testing.T) {
+	root := t.TempDir()
+	mem := &gtDecodeMemory{}
+	gtWriteSegment(t, root, "0000000001", "0000000001.trace", gtJoin(gtLines[:5]...))
+	gtWriteSegment(t, root, "0000000001", "0000000006.trace", gtJoin(gtLines[5:]...))
+	first, _ := gtSameRead(t, root, mem)
+	for name, seg := range mem.Segments {
+		if cap(seg.Records) != len(seg.Records) {
+			t.Fatalf("memory segment %s: cap %d, len %d", name, cap(seg.Records), len(seg.Records))
+		}
+	}
+	kept := append([]gtRecord{}, first.Records...)
+	// The second segment rewritten: the first is carried, the second is
+	// decoded afresh, and nothing of the first read changes.
+	lines := append([]string{}, gtLines...)
+	lines[7] = replaceOnce(t, lines[7], `"at":"2026-09-24T11:02:05Z"`, `"at":"2026-09-24T11:02:06Z"`)
+	gtWriteSegment(t, root, "0000000001", "0000000006.trace", gtJoin(lines[5:]...))
+	second, _ := gtSameRead(t, root, mem)
+	if second.Carried != 5 {
+		t.Fatalf("carried %d records, want the first segment's 5", second.Carried)
+	}
+	if !reflect.DeepEqual(first.Records, kept) {
+		t.Fatal("the previous read's records changed under a later read")
+	}
+	// One segment, nothing new: the boot's records are the memory's.
+	one := t.TempDir()
+	mem = &gtDecodeMemory{}
+	gtWriteSegment(t, one, "0000000001", "0000000001.trace", gtJoin(gtLines...))
+	gtSameRead(t, one, mem)
+	b, _ := gtSameRead(t, one, mem)
+	if b.Carried != len(gtLines) || cap(b.Records) != len(b.Records) {
+		t.Fatalf("a boot read from the memory: carried %d of %d, cap %d", b.Carried, len(b.Records), cap(b.Records))
+	}
+	grown := append(b.Records, gtRecord{Kind: "tick"})
+	if &grown[0] == &b.Records[0] {
+		t.Fatal("an append to a boot's records wrote into the memory")
+	}
+}
+
+// Carried counts the leading records the memory supplied: all of them for
+// an unchanged boot, the old ones for a grown boot, none when a byte of the
+// remembered prefix changed or no memory was consulted.
+func TestGTDecodeMemoryCarried(t *testing.T) {
+	root := t.TempDir()
+	end := time.Date(2026, 9, 24, 12, 0, 0, 0, time.UTC)
+	lines := gtSynthLines(200, end)
+	mem := &gtDecodeMemory{}
+	carried := func(want int) {
+		t.Helper()
+		b, err := gtSameRead(t, root, mem)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if b.Carried != want {
+			t.Fatalf("carried %d, want %d", b.Carried, want)
+		}
+	}
+	gtWriteSegment(t, root, "0000000001", "0000000001.trace", gtJoin(lines[:120]...))
+	carried(0)
+	carried(120)
+	gtWriteSegment(t, root, "0000000001", "0000000001.trace", gtJoin(lines[:150]...))
+	carried(120)
+	gtWriteSegment(t, root, "0000000001", "0000000151.trace", gtJoin(lines[150:]...))
+	carried(150)
+	carried(200)
+	changed := append([]string{}, lines[:150]...)
+	changed[2] = replaceOnce(t, changed[2], `"serial":"0a"`, `"serial":"0b"`)
+	gtWriteSegment(t, root, "0000000001", "0000000001.trace", padTo(t, gtJoin(changed...), len(gtJoin(lines[:150]...))))
+	carried(0)
+	if b, err := gtReadLatest(root); err != nil || b.Carried != 0 {
+		t.Fatalf("a read with no memory: %v", err)
+	}
+}
+
+// ---- the decoder's fast paths against the slow ones -----------------------
+
+// gtStrReference is the string rule with every value through
+// json.Unmarshal.
+func gtStrReference(raw []byte) (string, bool) {
+	if len(raw) == 0 || raw[0] != '"' {
+		return "", false
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err != nil {
+		return "", false
+	}
+	if strings.Contains(s, "-----BEGIN") {
+		return "", false
+	}
+	return s, true
+}
+
+// TestGTStrMatchesUnmarshal: the string decode is json.Unmarshal's, raw
+// value by raw value: escapes of every kind, inner quotes, control bytes,
+// invalid UTF-8, surrogates, and random values over an alphabet of the
+// bytes that matter.
+func TestGTStrMatchesUnmarshal(t *testing.T) {
+	cases := []string{
+		`""`, `"a"`, `"plain ascii"`, `"é ü 日本"`, "\"\x7f\"",
+		`"\n"`, `"a\nb"`, `"\""`, `"a\"b"`, `"\\"`, `"a\\b"`, `"\/"`, `"A"`, `"é"`,
+		`"😀"`, `"\ud800"`, `"\udc00x"`, `"\x"`, `"\u12"`, `"\"`,
+		`"a"b"`, `"a""`, `""""`, `"`, `"abc`, `abc"`, `"abc"x`, ` "abc"`, `"abc" `,
+		"\"a\x00b\"", "\"a\x01b\"", "\"a\x1fb\"", "\"a\tb\"", "\"a\nb\"", "\"a\rb\"",
+		"\"\xff\"", "\"a\xc3\"", "\"\xed\xa0\x80\"", "\"\xf4\x90\x80\x80\"", "\"\xc0\xaf\"",
+		`"-----BEGIN CERT"`, `"x-----BEGINy"`, `"-----BEGIN"`, `"-----BEGI"`,
+		`null`, `1`, `true`, `[]`, `{}`, ``,
+	}
+	check := func(raw []byte) {
+		t.Helper()
+		want, wok := gtStrReference(raw)
+		got, err := gtStr(raw, "k")
+		if (err == nil) != wok || got != want {
+			t.Fatalf("%q: decoded %q, %v; json.Unmarshal gives %q, ok=%v", raw, got, err, want, wok)
+		}
+	}
+	for _, c := range cases {
+		check([]byte(c))
+	}
+	alphabet := []byte("ab\\\"u0dD8e\x00\x01\x1f\x7f\xc3\xa9\xed\xa0\x80\xff /nrt-BEGIN")
+	rng := rand.New(rand.NewSource(1))
+	for i := 0; i < 200000; i++ {
+		raw := []byte{'"'}
+		for n := rng.Intn(12); n > 0; n-- {
+			raw = append(raw, alphabet[rng.Intn(len(alphabet))])
+		}
+		if rng.Intn(8) != 0 {
+			raw = append(raw, '"')
+		}
+		check(raw)
+	}
+	// Through a whole line: escapes and inner quotes decode as
+	// json.Unmarshal decodes them.
+	line := []byte(`{"kind":"acl","version":1,"sequence":4,"at":"2026-09-24T11:00:01Z","conn":1,"decision":"allow","rule":"allow-cn","reason":"cn \"matched\" é\n"}`)
+	rec, err := gtDecodeLine(line)
+	if err != nil || rec.ACL.Reason != "cn \"matched\" é\n" {
+		t.Fatalf("a line with escapes: %+v, %v", rec.ACL, err)
+	}
+}
+
+// TestGTIntMatchesRegex: the integer check is gtReInteger's, and the value
+// strconv's, raw value by raw value: leading zeros, signs, the int64
+// bounds, and random values over digits and the bytes around them.
+func TestGTIntMatchesRegex(t *testing.T) {
+	cases := []string{
+		"0", "-0", "1", "-1", "01", "-01", "00", "007", "10", "100", "-", "", "--1", "+1", "1-",
+		"1.0", "1e5", "0x1", " 1", "1 ", "٣", "9223372036854775807", "-9223372036854775808",
+		"9223372036854775808", "-9223372036854775809", "99999999999999999", "999999999999999999",
+		"-99999999999999999", "-999999999999999999", "1000000000000000000", "123456789012345678901234567890",
+	}
+	check := func(raw []byte) {
+		t.Helper()
+		if gtIsInteger(raw) != gtReInteger.Match(raw) {
+			t.Fatalf("%q: gtIsInteger %v, gtReInteger %v", raw, gtIsInteger(raw), gtReInteger.Match(raw))
+		}
+		o := &gtObject{order: []string{"n"}, vals: map[string]json.RawMessage{"n": raw}}
+		got, err := o.int("n")
+		trimmed := bytes.TrimSpace(raw)
+		want, werr := strconv.ParseInt(string(trimmed), 10, 64)
+		if !gtReInteger.Match(trimmed) {
+			werr = fmt.Errorf("not an integer")
+		}
+		if (err == nil) != (werr == nil) || (err == nil && got != want) {
+			t.Fatalf("%q: %d, %v; want %d, %v", raw, got, err, want, werr)
+		}
+	}
+	for _, c := range cases {
+		check([]byte(c))
+	}
+	// README 1.1 spells an integer without a leading zero, as JSON does.
+	for raw, ok := range map[string]bool{"0": true, "-0": true, "10": true, "01": false, "-01": false, "00": false} {
+		o := &gtObject{order: []string{"n"}, vals: map[string]json.RawMessage{"n": json.RawMessage(raw)}}
+		if _, err := o.int("n"); (err == nil) != ok {
+			t.Fatalf("%q: integer %v, want %v", raw, err == nil, ok)
+		}
+	}
+	alphabet := []byte("0123456789-+.e ")
+	rng := rand.New(rand.NewSource(1))
+	for i := 0; i < 200000; i++ {
+		var raw []byte
+		for n := rng.Intn(22); n > 0; n-- {
+			if rng.Intn(4) == 0 {
+				raw = append(raw, alphabet[rng.Intn(len(alphabet))])
+			} else {
+				raw = append(raw, '0'+byte(rng.Intn(10)))
+			}
+		}
+		check(raw)
 	}
 }

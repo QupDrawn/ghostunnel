@@ -33,8 +33,16 @@ type heartbeat struct {
 	Stop      bool
 }
 
+// readBoundedHook, when set, runs between readBounded's lstat and its open
+// (a test seam that changes what is at the name in that interval).
+var readBoundedHook func(path string)
+
 // readBounded returns a file's bytes, refusing without reading one whose
-// size exceeds max (SPEC 3.1: sizes are checked before content).
+// size exceeds max (SPEC 3.1: sizes are checked before content). What is
+// read is the file the lstat found and nothing else: the open neither
+// follows a link nor waits (openRead), and the open file must be a regular
+// file within the bound that is the same file as the lstat's, or nothing
+// is read. The read itself is still bounded by max+1.
 func readBounded(path string, max int64) ([]byte, error) {
 	info, err := os.Lstat(path)
 	if err != nil {
@@ -46,11 +54,33 @@ func readBounded(path string, max int64) ([]byte, error) {
 	if info.Size() > max {
 		return nil, fmt.Errorf("%d bytes exceeds the bound of %d", info.Size(), max)
 	}
-	f, err := os.Open(path)
+	// On Windows os reads a file's identity from its path lazily, at its
+	// first comparison; comparing the lstat's result with itself reads it
+	// now, so the comparison below is with the file found here.
+	if !os.SameFile(info, info) {
+		return nil, errors.New("cannot be identified")
+	}
+	if readBoundedHook != nil {
+		readBoundedHook(path)
+	}
+	f, err := openRead(path)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
+	opened, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !opened.Mode().IsRegular() {
+		return nil, errors.New("not a regular file when opened")
+	}
+	if !os.SameFile(info, opened) {
+		return nil, errors.New("changed between the lstat and the open")
+	}
+	if opened.Size() > max {
+		return nil, fmt.Errorf("%d bytes exceeds the bound of %d", opened.Size(), max)
+	}
 	data, err := io.ReadAll(io.LimitReader(f, max+1))
 	if err != nil {
 		return nil, err

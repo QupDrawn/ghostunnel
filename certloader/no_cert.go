@@ -27,6 +27,8 @@ type trustBundle struct {
 	caBundlePath string
 	// Cached *x509.CertPool
 	cachedCertPool atomic.Pointer[x509.CertPool]
+	// loaded is the bundle file of the last successful load.
+	loaded atomic.Pointer[LoadedFiles]
 }
 
 // NoCertificate creates an empty certificate with only a trust bundle.
@@ -43,13 +45,18 @@ func NoCertificate(caBundlePath string) (Certificate, error) {
 
 // Reload transparently reloads the certificate.
 func (c *trustBundle) Reload() error {
-	bundle, err := LoadTrustStore(c.caBundlePath)
+	bundle, caBytes, err := loadTrustStore(c.caBundlePath)
 	if err != nil {
 		return err
 	}
 
 	c.cachedCertPool.Store(bundle)
+	c.loaded.Store(&LoadedFiles{CABundlePath: c.caBundlePath, CABundle: caBytes})
 	return nil
+}
+
+func (c *trustBundle) loadedFiles() *LoadedFiles {
+	return c.loaded.Load()
 }
 
 // GetIdentifier returns an identifier for the certificate for logging.

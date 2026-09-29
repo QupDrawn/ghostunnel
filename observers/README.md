@@ -138,7 +138,7 @@ Every member takes the same structural flags; `deploy/systemd/*.service` carries
 | `-traces` | `/var/lib/ghostunnel-ring/stores/gt` | the trace root |
 | `-tree` | `/etc/ghostunnel/tree.tsv` | the deployment's tree, for `own-store-private` |
 | `-accept-no-store-check` | empty | the OS this member runs on, to accept that `own-store-private` cannot run there; refused on linux |
-| `-window` | `4` | the heartbeat window |
+| `-window` | `3` | the heartbeat window |
 | `-stale-slack` | `1` | the slack over a peer's declared cadence before it is stale |
 | `-staging-stale-after` | `60s` | how old a staging file may be before it is a crash |
 | `-max-heartbeat-bytes`, `-max-fault-bytes`, `-max-halt-bytes` | `8192` | the size bound of each file kind, checked before it is read |

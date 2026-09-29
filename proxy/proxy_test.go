@@ -1095,16 +1095,18 @@ func TestForceHandshakeNonTLSConn(t *testing.T) {
 	assert.Nil(t, err, "forceHandshake should succeed for non-TLS conn")
 }
 
-func TestIsACMEChallengeConn(t *testing.T) {
-	// Non-TLS conn is never an ACME challenge.
+func TestIsACMEChallenge(t *testing.T) {
+	// A non-TLS conn has no state and is never an ACME challenge.
+	assert.False(t, isACMEChallenge(nil), "a conn with no TLS state must not be classified as ACME")
+
+	// TLS conn with no negotiated protocol is not an ACME challenge.
 	a, b := net.Pipe()
 	defer a.Close()
 	defer b.Close()
-	assert.False(t, isACMEChallengeConn(a), "plain net.Conn must not be classified as ACME")
+	state := tls.Client(a, &tls.Config{InsecureSkipVerify: true}).ConnectionState()
+	assert.False(t, isACMEChallenge(&state), "TLS conn with empty NegotiatedProtocol must not be classified as ACME")
 
-	// TLS conn with no negotiated protocol is not an ACME challenge.
-	tlsConn := tls.Client(a, &tls.Config{InsecureSkipVerify: true})
-	assert.False(t, isACMEChallengeConn(tlsConn), "TLS conn with empty NegotiatedProtocol must not be classified as ACME")
+	assert.True(t, isACMEChallenge(&tls.ConnectionState{NegotiatedProtocol: "acme-tls/1"}), "acme-tls/1 is the challenge protocol")
 }
 
 func TestACMEChallengeNotForwardedToBackend(t *testing.T) {

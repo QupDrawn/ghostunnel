@@ -52,7 +52,7 @@ ExecStart=/usr/local/bin/ghostunnel-obs-tunnel \
     -slot-owners tunnel=gtobs-tunnel,admin=gtobs-admin,material=gtobs-material,super=gtobs-super \
     -stores /var/lib/ghostunnel-ring/stores \
     -traces /var/lib/ghostunnel-ring/stores/gt \
-    -window 4 \
+    -window 3 \
     -min-cycle 300ms \
     -cadence 10 \
     -heartbeat-max-age 30s \

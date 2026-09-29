@@ -40,7 +40,7 @@ type Config struct {
 	TracesRoot string
 
 	// Values to be set (SPEC 18).
-	Window            int           // WINDOW, 4 by design
+	Window            int           // WINDOW (SPEC 6): -window, 3 by default
 	StaleSlack        float64       // STALE_SLACK (SPEC 8)
 	StagingStaleAfter time.Duration // STAGING_STALE_AFTER_SECONDS
 	MaxHeartbeatBytes int64
@@ -193,11 +193,28 @@ type State struct {
 	// decodes only the lines beyond it. Allocated by bootEndedFindings
 	// while a boot is pending and dropped when none is.
 	BootEndedDecode *gtDecodeMemory
+	// StartLines is boot-ambiguous's memory (bootliveness.go): the decode
+	// of each boot's start line under the SHA-256 of the line's bytes,
+	// which are read every cycle (contentmemo.go). Allocated on first use.
+	StartLines *contentMemo[startLineDecode]
+	// Certificates is material-loaded's memory (materialchecks.go): the
+	// parse of each certificate or CA bundle file under the SHA-256 of its
+	// bytes, which are read and hashed every cycle, the validity windows
+	// judged against the clock every cycle (contentmemo.go). Allocated on
+	// first use.
+	Certificates *contentMemo[certificateParse]
 	// Substance is the substance rules' memory (substance.go): chain
 	// verifications, leaf judgements and compiled policies under content
 	// hashes, emptied when the boot changes. Allocated by
 	// substanceJudgeFor on first use; never read by the structural core.
 	Substance *substanceCache
+	// TunnelJudgement is the tunnel surface's judgement kept across cycles
+	// (judgememory.go): the facts of the records judged so far, extended
+	// each cycle from the records not yet judged while the read proves the
+	// judged ones unchanged, and judged again from none otherwise.
+	// Allocated by substanceJudgeFor on first use; never read by the
+	// structural core.
+	TunnelJudgement *tunnelJudgement
 	// Parses is the strict parse of every heartbeat entry the last cycle
 	// read, keyed by the SHA-256 of its bytes (parseMemory, chain.go): an
 	// entry whose bytes hash the same this cycle is that parse. Allocated

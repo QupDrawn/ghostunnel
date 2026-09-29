@@ -23,11 +23,38 @@ import (
 // has no directory sync and there it is a no-op.
 var hasDirSync = runtime.GOOS != "windows"
 
-// storeMu serialises the stores' writes: two writers of the same first-seen
-// content at once would otherwise both write <hash>.tmp. Under it the
-// second finds the final file and writes nothing. The lock is per process,
+// The stores' writes are serialised per file: two writers of the same
+// first-seen content at once would otherwise both write <hash>.tmp, and
+// the second could find the final file between the first's rename and its
+// directory sync and return before the content is durable.
+// Every write first claims its final path (claim): a writer of the same
+// content waits for the one in progress and then either fails with its
+// error or looks again, so it finds the file only once the first is done
+// with it; a writer of other content goes on. The locks are per process,
 // and the trace root has one writer, so that is every writer.
-var storeMu sync.Mutex
+var (
+	writesMu sync.Mutex
+	writes   = map[string]*storeWrite{}
+)
+
+// storeWrite is one write of a stored file in progress; done is closed
+// once err is its outcome.
+type storeWrite struct {
+	done chan struct{}
+	err  error
+}
+
+// dirMu serialises ensureDir: the lstat of a store's directory, and the
+// first time its creation and the root's sync, which every writer waits
+// for before going on. dirFailed, under it, holds by store directory the
+// failed sync that may have left a name in that store (or the store's own
+// entry in the root) not durable; every later write into that store fails
+// with it, since a sync that has failed once cannot vouch for what was
+// written before it.
+var (
+	dirMu     sync.Mutex
+	dirFailed = map[string]error{}
+)
 
 // chainSyncHook, when set, is called in place of every sync the stores
 // make (SetChainSyncHook).
@@ -74,7 +101,7 @@ func syncChainDir(path string) error {
 	if !hasDirSync {
 		return hook(path, nil)
 	}
-	d, err := os.Open(path)
+	d, err := openDir(path)
 	if err != nil {
 		return err
 	}
@@ -116,39 +143,92 @@ func (s store) errorf(format string, args ...interface{}) error {
 // has refused empty and oversize content already.
 func (s store) write(root string, data []byte) (string, error) {
 	hash := hashOf(data)
-	storeMu.Lock()
-	defer storeMu.Unlock()
 	dir := filepath.Join(root, s.dir)
-	if err := s.ensureDir(root, dir); err != nil {
-		return "", err
-	}
 	final := s.path(root, hash)
-	if info, err := os.Lstat(final); err == nil {
-		if !info.Mode().IsRegular() {
-			return "", s.errorf("%s is not a regular file", final)
-		}
-		return hash, nil
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return "", s.errorf("%w", err)
-	}
-	tmp := filepath.Join(dir, hash+".tmp")
-	if err := s.writeTmp(tmp, data); err != nil {
-		_ = os.Remove(tmp)
+	w, err := claim(final)
+	if err != nil {
 		return "", err
 	}
-	if err := os.Rename(tmp, final); err != nil {
-		_ = os.Remove(tmp)
-		return "", s.errorf("%w", err)
+	// ensureDir runs under the claim: a failed sync is recorded before its
+	// writer lets go of its claim, so whoever claims after it sees it.
+	if err = s.ensureDir(root, dir); err == nil {
+		err = s.writeClaimed(dir, final, hash, data)
 	}
-	if err := syncChainDir(dir); err != nil {
-		return "", s.errorf("sync %s: %w", dir, err)
+	writesMu.Lock()
+	delete(writes, final)
+	writesMu.Unlock()
+	w.err = err
+	close(w.done)
+	if err != nil {
+		return "", err
 	}
 	return hash, nil
 }
 
+// claim makes the caller the one writer of final. A write of it in
+// progress is waited for first: one that failed fails the caller with its
+// error; after one that succeeded the caller claims it and finds the file.
+func claim(final string) (*storeWrite, error) {
+	for {
+		writesMu.Lock()
+		in := writes[final]
+		if in == nil {
+			w := &storeWrite{done: make(chan struct{})}
+			writes[final] = w
+			writesMu.Unlock()
+			return w, nil
+		}
+		writesMu.Unlock()
+		<-in.done
+		if in.err != nil {
+			return nil, in.err
+		}
+	}
+}
+
+// writeClaimed is write's part under the claim on final: nothing when the
+// file exists, else the synced .tmp, the rename and the directory sync.
+func (s store) writeClaimed(dir, final, hash string, data []byte) error {
+	if info, err := os.Lstat(final); err == nil {
+		if !info.Mode().IsRegular() {
+			return s.errorf("%s is not a regular file", final)
+		}
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return s.errorf("%w", err)
+	}
+	tmp := filepath.Join(dir, hash+".tmp")
+	if err := s.writeTmp(tmp, data); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, final); err != nil {
+		_ = os.Remove(tmp)
+		return s.errorf("%w", err)
+	}
+	if err := syncChainDir(dir); err != nil {
+		err = s.errorf("sync %s: %w", dir, err)
+		dirMu.Lock()
+		if dirFailed[dir] == nil {
+			dirFailed[dir] = err
+		}
+		dirMu.Unlock()
+		return err
+	}
+	return nil
+}
+
 // ensureDir creates root/<dir> when it is absent and syncs root so the
-// entry is durable; an existing entry that is not a directory is an error.
+// entry is durable; an existing entry that is not a directory is an error,
+// and so is a store whose directory has had a sync fail (dirFailed). It
+// runs under dirMu, so a writer that finds the directory finds it after
+// the sync of its creation.
 func (s store) ensureDir(root, dir string) error {
+	dirMu.Lock()
+	defer dirMu.Unlock()
+	if err := dirFailed[dir]; err != nil {
+		return err
+	}
 	info, err := os.Lstat(dir)
 	if err == nil {
 		if !info.IsDir() {
@@ -163,7 +243,9 @@ func (s store) ensureDir(root, dir string) error {
 		return s.errorf("%w", err)
 	}
 	if err := syncChainDir(root); err != nil {
-		return s.errorf("sync %s: %w", root, err)
+		err = s.errorf("sync %s: %w", root, err)
+		dirFailed[dir] = err
+		return err
 	}
 	return nil
 }
@@ -200,7 +282,7 @@ func (s store) writeTmp(tmp string, data []byte) error {
 // content is read, and the read bounded by it), and hash to its name.
 // Nothing is returned with an error.
 func (s store) read(root, hash string) ([]byte, error) {
-	if !reHash.MatchString(hash) {
+	if !isHash(hash) {
 		return nil, s.errorf("%q is not a lower-case SHA-256 hex string", hash)
 	}
 	path := s.path(root, hash)

@@ -148,11 +148,12 @@ func startProxy(binary, logPath string, args []string, listen, status string) (*
 	}
 	cmd := exec.Command(binary, args...)
 	cmd.Stdout, cmd.Stderr = lf, lf
-	if err := cmd.Start(); err != nil {
+	dieWithTool(cmd)
+	p := &proxyProc{cmd: cmd, listen: listen, status: status, logPath: logPath, logFile: lf, exited: make(chan error, 1)}
+	if err := startChild(cmd, p); err != nil {
 		lf.Close()
 		return nil, err
 	}
-	p := &proxyProc{cmd: cmd, listen: listen, status: status, logPath: logPath, logFile: lf, exited: make(chan error, 1)}
 	go func() { p.exited <- cmd.Wait() }()
 	return p, nil
 }
@@ -191,6 +192,7 @@ func (p *proxyProc) stop() {
 			p.exited <- err
 		}
 		p.logFile.Close()
+		releaseChild(p)
 	})
 }
 
@@ -207,7 +209,6 @@ func (p *proxyProc) tail(n int) string {
 	return strings.Join(lines, "\n")
 }
 
-// gateReasons returns the ring's refusal lines from the process log.
 // warmPoolLine is what the fork logged about its warm backend pool at
 // startup ("warm backend pool: ..."), or "" for a tree that logs none.
 func (p *proxyProc) warmPoolLine() string {
@@ -223,6 +224,7 @@ func (p *proxyProc) warmPoolLine() string {
 	return ""
 }
 
+// gateReasons returns the ring's refusal lines from the process log.
 func (p *proxyProc) gateReasons() []string {
 	data, err := os.ReadFile(p.logPath)
 	if err != nil {

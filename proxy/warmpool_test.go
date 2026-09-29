@@ -391,3 +391,117 @@ func TestWarmPoolBackendSpeaksFirst(t *testing.T) {
 		t.Fatalf("one connection served, %d handler dials", d.handler.Load())
 	}
 }
+
+// awaitPooled waits until the proxy's pool has started and holds at least
+// n connections, and returns the pool.
+func awaitPooled(t *testing.T, p *Proxy, n int) *warmPool {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	w := p.warmPool()
+	for w == nil {
+		if time.Now().After(deadline) {
+			t.Fatal("the warm pool never started")
+		}
+		time.Sleep(5 * time.Millisecond)
+		w = p.warmPool()
+	}
+	for {
+		w.mu.Lock()
+		got := len(w.conns)
+		w.mu.Unlock()
+		if got >= n {
+			return w
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("pool holds %d connections, waiting for %d", got, n)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// TestWarmPoolHandoutForgetsBackoff: a pooled connection handed out alive
+// has proved the backend usable, so the delay after failures is forgotten;
+// the connection comes back with no deadline left on it.
+func TestWarmPoolHandoutForgetsBackoff(t *testing.T) {
+	e := newEchoBackend(t)
+	p, _, _ := warmProxyForTest(t, e, 1, time.Minute)
+	w := awaitPooled(t, p, 1)
+	w.mu.Lock()
+	w.backoff = acceptBackoffMax
+	w.mu.Unlock()
+
+	c := w.take()
+	if c == nil {
+		t.Fatal("a live pooled connection was not handed out")
+	}
+	defer c.Close()
+	w.mu.Lock()
+	got := w.backoff
+	w.mu.Unlock()
+	if got != 0 {
+		t.Fatalf("backoff %s after a live handout, want 0", got)
+	}
+	// No deadline is left: a read waits for the backend's echo.
+	if _, err := c.Write([]byte("A")); err != nil {
+		t.Fatal(err)
+	}
+	var b [1]byte
+	if _, err := c.Read(b[:]); err != nil {
+		t.Fatalf("the handed-out connection kept a deadline: %v", err)
+	}
+}
+
+// stuckDeadlineConn refuses to clear its read deadline.
+type stuckDeadlineConn struct {
+	net.Conn
+}
+
+func (c stuckDeadlineConn) SetReadDeadline(t time.Time) error {
+	if t.IsZero() {
+		return errors.New("deadline cannot be cleared, for test")
+	}
+	return c.Conn.SetReadDeadline(t)
+}
+
+// TestWarmPoolHandoutKeepsBackoffWhenTheDeadlineStays: a pooled connection
+// whose probe deadline cannot be cleared is not handed out (it is closed,
+// and the handler dials itself), and it has proved nothing, so the delay
+// after failures stands.
+func TestWarmPoolHandoutKeepsBackoffWhenTheDeadlineStays(t *testing.T) {
+	e := newEchoBackend(t)
+	incoming, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dialer := func(ctx context.Context) (net.Conn, error) {
+		var nd net.Dialer
+		c, err := nd.DialContext(ctx, "tcp", e.ln.Addr().String())
+		if err != nil {
+			return nil, err
+		}
+		return stuckDeadlineConn{c}, nil
+	}
+	p := New(incoming, 5*time.Second, 5*time.Second, 0, 0, dialer, &testLogger{}, LogEverything, ProxyProtocolOff, nil)
+	p.WarmBackendConnections = 1
+	p.WarmBackendIdle = time.Minute
+	go p.Accept()
+	t.Cleanup(func() {
+		p.Shutdown()
+		p.Wait()
+	})
+	w := awaitPooled(t, p, 1)
+	w.mu.Lock()
+	w.backoff = acceptBackoffMax
+	w.mu.Unlock()
+
+	if c := w.take(); c != nil {
+		c.Close()
+		t.Fatal("a connection whose deadline could not be cleared was handed out")
+	}
+	w.mu.Lock()
+	got := w.backoff
+	w.mu.Unlock()
+	if got != acceptBackoffMax {
+		t.Fatalf("backoff %s after a failed handout, want %s", got, acceptBackoffMax)
+	}
+}

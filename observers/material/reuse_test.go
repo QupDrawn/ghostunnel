@@ -9,6 +9,7 @@ package main
 // file. The tests are not parallel: the hooks are package state.
 
 import (
+	"bytes"
 	"errors"
 	"os"
 	"path/filepath"
@@ -290,5 +291,70 @@ func TestStep11ReadsLive(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("the slot that appeared after the look is not cleared: %v", out.Clears.Removes)
+	}
+}
+
+// A cycle hashes each own heartbeat entry once: I5 and procedure C judge
+// the same bytes, read once, and both judge them by the one hash taken of
+// them. The hash is marked here, so that a site hashing the bytes itself
+// would judge by a different value than the other.
+func TestCycleHashesEachOwnEntryOnce(t *testing.T) {
+	cfg, st, tmp := fixtureCopy(t, "healthy-ring")
+	own, err := os.ReadFile(hbPath(tmp, "tunnel", 44, "heartbeat"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const marked = "marked"
+	prev := snapshotSum
+	t.Cleanup(func() { snapshotSum = prev })
+	calls := 0
+	snapshotSum = func(b []byte) string {
+		if bytes.Equal(b, own) {
+			calls++
+			return marked
+		}
+		return prev(b)
+	}
+	r := newReader(cfg, st)
+	r.checkI5()
+	res := r.runC(r.storePath("tunnel", "heartbeat"), "tunnel/heartbeat", "tunnel")
+	if calls != 1 {
+		t.Fatalf("the own heartbeat entry was hashed %d times, want once", calls)
+	}
+	if !r.seen[Finding{Check: "I5", Subject: "tunnel/heartbeat/0000000044.hb"}] {
+		t.Fatal("I5 did not judge the entry by the one hash")
+	}
+	if res.Highest == nil || res.Highest.Seq != 44 || res.Highest.Hash != marked || !res.Hashes[marked] {
+		t.Fatal("procedure C did not judge the entry by the one hash")
+	}
+}
+
+// hashOf serves the hash of the snapshot's own bytes for a path and of no
+// other bytes: bytes that are not the slice the snapshot holds, even of
+// the same path, are hashed as they are.
+func TestHashOfIsTheHashOfTheBytesGiven(t *testing.T) {
+	r := newReader(&Config{Identity: "tunnel", Members: []string{"tunnel"}}, &State{})
+	p := filepath.Join(t.TempDir(), "0000000001.hb")
+	if err := os.WriteFile(p, []byte("first"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	data, err := r.read(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := r.hashOf(p, data); got != sha256Hex([]byte("first")) {
+		t.Fatalf("hash of the snapshot's bytes: %s", got)
+	}
+	if got := r.hashOf(p, []byte("other")); got != sha256Hex([]byte("other")) {
+		t.Fatalf("hash of other bytes for the same path: %s", got)
+	}
+	if got := r.hashOf(p, data[:2]); got != sha256Hex([]byte("fi")) {
+		t.Fatalf("hash of part of the snapshot's bytes: %s", got)
+	}
+	if got := r.hashOf(filepath.Join(filepath.Dir(p), "unread"), data); got != sha256Hex(data) {
+		t.Fatalf("hash for a path the snapshot has not read: %s", got)
+	}
+	if got, _, _ := r.readWithin(p, 4096); r.hashOf(p, got) != sha256Hex([]byte("first")) {
+		t.Fatal("the bounded read served from the whole read hashes otherwise")
 	}
 }

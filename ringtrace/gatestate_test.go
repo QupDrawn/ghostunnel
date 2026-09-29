@@ -304,6 +304,27 @@ func TestGateStateWatcherReportsTheTree(t *testing.T) {
 	if got := s.Scans(); got != scans+1 {
 		t.Fatalf("%d scans, want %d", got, scans+1)
 	}
+	// A delivered halt in a store's halts/ is reported the same way.
+	scans, events = s.Scans(), s.Events()
+	slot := filepath.Join(root, "tunnel", "halts", "admin")
+	writeRaw(t, slot, `{"kind":"halt",`)
+	waitEvents(t, s, events)
+	clock.Advance(time.Millisecond)
+	if d := s.Check(); d.Serve {
+		t.Fatal("served after the watcher reported the delivered halt")
+	}
+	if got := s.Scans(); got != scans+1 {
+		t.Fatalf("%d scans, want %d", got, scans+1)
+	}
+	events = s.Events()
+	if err := os.Remove(slot); err != nil {
+		t.Fatal(err)
+	}
+	waitEvents(t, s, events)
+	clock.Advance(time.Millisecond)
+	if d := s.Check(); !d.Serve {
+		t.Fatalf("refused after the delivered halt was cleared: %s", d.Reason)
+	}
 	// With nothing reported, checks well past the window reuse the state.
 	time.Sleep(100 * time.Millisecond)
 	s.Check()

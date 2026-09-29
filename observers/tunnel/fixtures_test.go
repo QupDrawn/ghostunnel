@@ -463,8 +463,9 @@ type expectSurface struct {
 // judgeSurface reads the fixture's gt/ as the members do and computes the
 // named surface as every member computes it for surface-disagree
 // (surfaceFindings), twice over the same bytes with one memory, as two
-// cycles do: the second judges the chains from the first's memory and
-// must find the same.
+// cycles do: the first judges every record, the second extends the first's
+// kept judgement (judgememory.go) and judges the chains from the first's
+// memory, and must find the same.
 func judgeSurface(t *testing.T, m *manifest, tmp string, now time.Time) {
 	raw, ok := m.Expect["surface"]
 	if !ok {
@@ -495,7 +496,14 @@ func judgeSurface(t *testing.T, m *manifest, tmp string, now time.Time) {
 		if len(boot.Records) == 0 || boot.Records[0].Start == nil {
 			t.Fatalf("surface read %d: the boot has no start line", cycle)
 		}
+		var kept *tunnelState
+		if st.TunnelJudgement != nil {
+			kept = st.TunnelJudgement.tunnel
+		}
 		got := surfaceFindings(owner, boot, now, surfaceMargins{}, substanceJudgeFor(cfg, st))
+		if owner == surfaceTunnel && cycle == 2 && (kept == nil || st.TunnelJudgement.tunnel != kept) {
+			t.Errorf("surface read 2: the first read's judgement was not kept")
+		}
 		gs := make([]string, 0, len(got))
 		for _, f := range got {
 			gs = append(gs, findingKey(f.Check, f.SubjectPtr()))

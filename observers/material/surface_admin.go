@@ -74,35 +74,31 @@ func adminSurfaceFindings(boot *gtBoot) []Finding {
 		}
 	}
 
-	// Shutdown requests.
-	for i := range boot.Records {
-		s := boot.Records[i].Shutdown
-		if s == nil {
-			continue
-		}
-		if !s.Authorized {
-			fail(checkShutdownAuthorized, s.Source)
-		}
-		if s.Source == "status-endpoint" && s.Peer == nil {
-			fail(checkShutdownAuthorized, s.Source+":no-peer")
-		}
-	}
-
-	// The status listener's death: the one line that says why the proxy
-	// refuses, which it writes once and which stands for the boot.
+	// One walk: the shutdown requests, and the status listener's death,
+	// the one line that says why the proxy refuses, which it writes once
+	// and which stands for the boot. The shutdown findings come first, in
+	// the order of their lines, then the listener's.
+	var down []Finding
 	seen := map[string]bool{}
 	for i := range boot.Records {
-		r := boot.Records[i].Refusal
-		if r == nil || r.Source != "status-listener" {
-			continue
+		rec := &boot.Records[i]
+		if s := rec.Shutdown; s != nil {
+			if !s.Authorized {
+				fail(checkShutdownAuthorized, s.Source)
+			}
+			if s.Source == "status-endpoint" && s.Peer == nil {
+				fail(checkShutdownAuthorized, s.Source+":no-peer")
+			}
 		}
-		subject := boundBytes(r.Error, statusListenerSubjectBytes)
-		if !seen[subject] {
-			seen[subject] = true
-			fail(checkStatusListenerUp, subject)
+		if r := rec.Refusal; r != nil && r.Source == "status-listener" {
+			subject := boundBytes(r.Error, statusListenerSubjectBytes)
+			if !seen[subject] {
+				seen[subject] = true
+				down = append(down, Finding{Check: checkStatusListenerUp, Subject: subject})
+			}
 		}
 	}
-	return out
+	return append(out, down...)
 }
 
 // isLoopbackListen reports whether a status address of the forms the flag

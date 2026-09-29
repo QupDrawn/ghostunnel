@@ -259,9 +259,13 @@ func startRingServerOn(t *testing.T, pki *ringPKI, traces, stores string, maxAge
 	if configure != nil {
 		configure()
 	}
+	// A policy the flags name is loaded as run loads it, and served with.
+	regoPolicy, err := loadOPAPolicy(*serverAllowPolicy, *serverAllowQuery)
+	require.NoError(t, err)
+	env.regoPolicy = regoPolicy
 	sink := logger.Writer().(lockedBuffer)
 	s := &ringServer{env: env, addr: *serverListenAddress, log: sink.buf, logs: sink.mu, done: make(chan error, 1)}
-	go func() { s.done <- serverListen(env, nil) }()
+	go func() { s.done <- serverListen(env, regoPolicy) }()
 
 	// Wait for the accept loop, not by connecting (a probe connection would
 	// itself be traced) but on the status handler's own readiness flag,
@@ -759,7 +763,7 @@ func TestRingIsMandatory(t *testing.T) {
 		assert.Error(t, err)
 		assert.Equal(t, http.StatusServiceUnavailable, statusCode(s.env))
 		assert.Contains(t, s.logged(), "refusing connection")
-		assert.Contains(t, s.logged(), "gate: root")
+		assert.Contains(t, s.logged(), "gate: admin/halts")
 		recs := records(t, traces, 1)
 		assert.Equal(t, "start accept close", kinds(recs))
 		assert.Equal(t, "halt", recs[2].Body.(*ringtrace.Close).Reason)
@@ -1214,16 +1218,17 @@ func TestRingFailedReloadRefusesToServe(t *testing.T) {
 	assert.Equal(t, 2, halts, "the connection in flight and the refused accept both closed with reason halt")
 }
 
-// TestRingFailedHashAtReloadRefusesToServe: material that cannot be hashed
-// at reload is a failed reload even when the TLS reload itself succeeded:
-// the reload line says failed, names the file, carries no hash for it, and
-// serving stops until a reload succeeds with every hash.
-func TestRingFailedHashAtReloadRefusesToServe(t *testing.T) {
+// TestRingFailedPolicyReloadRefusesToServe: a policy that cannot be
+// reloaded is a failed reload even when the TLS reload itself succeeded:
+// the reload line says failed, names the file, records the policy still in
+// use by the hash of the bytes it was compiled from, and serving stops
+// until a reload succeeds.
+func TestRingFailedPolicyReloadRefusesToServe(t *testing.T) {
 	pki := newRingPKI(t)
 	traces := t.TempDir()
 	policy := filepath.Join(t.TempDir(), "policy.rego")
 	require.NoError(t, os.WriteFile(policy, []byte("package x\n"), 0o644))
-	s := startRingServerWith(t, pki, traces, healthyStores(t), 10*time.Second, func() { *serverAllowPolicy = policy })
+	s := startRingServerWith(t, pki, traces, healthyStores(t), 10*time.Second, func() { *serverAllowPolicy, *serverAllowQuery = policy, "data.x.allow" })
 	ready := countReady(t)
 
 	got, err := echoThrough(s.addr, pki, pki.allowed)
@@ -1250,7 +1255,8 @@ func TestRingFailedHashAtReloadRefusesToServe(t *testing.T) {
 		}
 	}
 	require.NotNil(t, policyMaterial)
-	assert.Nil(t, policyMaterial.SHA256, "no hash for a file that could not be read")
+	require.NotNil(t, policyMaterial.SHA256)
+	assert.Equal(t, ringtrace.MaterialHash([]byte("package x\n")), *policyMaterial.SHA256, "the policy still in use, not the file that could not be read")
 
 	require.NoError(t, os.WriteFile(policy, []byte("package x\n"), 0o644))
 	s.env.reload()
@@ -1265,8 +1271,6 @@ func TestRingFailedHashAtReloadRefusesToServe(t *testing.T) {
 	assert.True(t, reloads[1].Serving)
 }
 
-// TestACLRules: the start line's acl is exactly what the verifier applies,
-// in the closed vocabulary, sorted and deduplicated, in both modes.
 // TestRingConfigRecordsProxyProtocol pins the start line's proxy_protocol
 // to the mode the tunnel listener's connections are handed to the backend
 // with: each of proxy's modes by its trace name, and a mode the trace has
@@ -1282,13 +1286,13 @@ func TestRingConfigRecordsProxyProtocol(t *testing.T) {
 	for mode, want := range map[proxy.ProxyProtocolMode]string{
 		proxy.ProxyProtocolOff: "off", proxy.ProxyProtocolConn: "conn", proxy.ProxyProtocolTLS: "tls", proxy.ProxyProtocolTLSFull: "tls-full",
 	} {
-		cfg, _, err := ringConfig("server", "a", "b", mode, nil, ringtrace.SandboxApplied, "", ringRules{acl: auth.ACL{AllowAll: true}})
+		cfg, _, err := ringConfig("server", "a", "b", mode, nil, ringtrace.SandboxApplied, ringSources{tls: caSource(t, pki.caPath)}, ringRules{acl: auth.ACL{AllowAll: true}})
 		require.NoError(t, err)
 		assert.Equal(t, want, cfg.ProxyProtocol)
 		_, err = ringtrace.EncodeLine(ringtrace.Record{Sequence: 1, At: time.Now(), Body: &ringtrace.Start{Boot: 1, PID: 1, Config: cfg}})
 		assert.NoError(t, err, "the recorded mode is in the format's set")
 	}
-	_, _, err := ringConfig("server", "a", "b", proxy.ProxyProtocolMode(99), nil, ringtrace.SandboxApplied, "", ringRules{acl: auth.ACL{AllowAll: true}})
+	_, _, err := ringConfig("server", "a", "b", proxy.ProxyProtocolMode(99), nil, ringtrace.SandboxApplied, ringSources{tls: caSource(t, pki.caPath)}, ringRules{acl: auth.ACL{AllowAll: true}})
 	assert.Error(t, err, "a mode the trace cannot name is refused")
 }
 
@@ -1316,7 +1320,7 @@ func TestRingConfigRecordsBinary(t *testing.T) {
 	savedRecord := ringStartBinary
 	t.Cleanup(func() { ringStartBinary = savedRecord })
 	ringStartBinary = &ringBinaryRecord{}
-	cfg, _, err := ringConfig("server", "a", "b", proxy.ProxyProtocolOff, nil, ringtrace.SandboxApplied, "", ringRules{acl: auth.ACL{AllowAll: true}})
+	cfg, _, err := ringConfig("server", "a", "b", proxy.ProxyProtocolOff, nil, ringtrace.SandboxApplied, ringSources{tls: caSource(t, pki.caPath)}, ringRules{acl: auth.ACL{AllowAll: true}})
 	require.NoError(t, err)
 	assert.Equal(t, ringtrace.Binary{Path: path, SHA256: hex.EncodeToString(sum[:])}, cfg.Binary)
 	line, err := ringtrace.EncodeLine(ringtrace.Record{Sequence: 1, At: time.Now(), Body: &ringtrace.Start{Boot: 1, PID: 1, Config: cfg}})
@@ -1329,7 +1333,7 @@ func TestRingConfigRecordsBinary(t *testing.T) {
 	savedExe := ringExecutable
 	t.Cleanup(func() { ringExecutable = savedExe })
 	ringExecutable = func() (string, error) { return "", errors.New("no executable") }
-	again, _, err := ringConfig("server", "a", "b", proxy.ProxyProtocolOff, nil, ringtrace.SandboxApplied, "", ringRules{acl: auth.ACL{AllowAll: true}})
+	again, _, err := ringConfig("server", "a", "b", proxy.ProxyProtocolOff, nil, ringtrace.SandboxApplied, ringSources{tls: caSource(t, pki.caPath)}, ringRules{acl: auth.ACL{AllowAll: true}})
 	require.NoError(t, err)
 	assert.Equal(t, cfg.Binary, again.Binary)
 	ringExecutable = savedExe
@@ -1370,7 +1374,7 @@ func TestRingConfigRecordsBinary(t *testing.T) {
 	} {
 		ringStartBinary = &ringBinaryRecord{}
 		ringExecutable = exe
-		_, _, err := ringConfig("server", "a", "b", proxy.ProxyProtocolOff, nil, ringtrace.SandboxApplied, "", ringRules{acl: auth.ACL{AllowAll: true}})
+		_, _, err := ringConfig("server", "a", "b", proxy.ProxyProtocolOff, nil, ringtrace.SandboxApplied, ringSources{tls: caSource(t, pki.caPath)}, ringRules{acl: auth.ACL{AllowAll: true}})
 		ringExecutable = savedExe
 		assert.Error(t, err, "%s: an executable that cannot be hashed refuses the start", name)
 	}
@@ -1400,6 +1404,8 @@ func TestRunRecordsBinaryBeforeSandbox(t *testing.T) {
 	assert.NoError(t, fresh.err)
 }
 
+// TestACLRules: the start line's acl is exactly what the verifier applies,
+// in the closed vocabulary, sorted and deduplicated, in both modes.
 func TestACLRules(t *testing.T) {
 	hash := "c" + strings.Repeat("2", 63)
 	withPolicy := []ringtrace.Material{{Material: "policy", Path: "p.rego", SHA256: &hash}}
@@ -1602,9 +1608,9 @@ func TestWatchdogHealth(t *testing.T) {
 		require.NoError(t, err)
 		wedged := &blockingListener{inner: inner, block: make(chan struct{})}
 		env := newRingEnv(t, pki, t.TempDir(), healthyStores(t), 10*time.Second)
-		cfg, ca, err := ringConfig("server", *serverListenAddress, *serverForwardAddress, proxy.ProxyProtocolOff, nil, sandboxState(), "", ringRules{acl: auth.ACL{AllowAll: true}})
+		cfg, ca, err := ringConfig("server", *serverListenAddress, *serverForwardAddress, proxy.ProxyProtocolOff, nil, sandboxState(), ringSources{tls: env.tlsConfigSource}, ringRules{acl: auth.ACL{AllowAll: true}})
 		require.NoError(t, err)
-		env.ring, err = openRing(cfg, ca, auth.ACL{AllowAll: true}, true, "")
+		env.ring, err = openRing(cfg, ca, auth.ACL{AllowAll: true}, true, ringSources{tls: env.tlsConfigSource})
 		require.NoError(t, err)
 		defer env.ring.close()
 		p := proxy.New(wedged, time.Second, time.Second, 0, 0, env.dial, logger, 0, proxy.ProxyProtocolOff, proxy.NilMetrics())

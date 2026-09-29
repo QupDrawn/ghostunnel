@@ -13,7 +13,6 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"sort"
 	"syscall"
 )
 
@@ -57,16 +56,4 @@ func probeOwnStore(cfg *Config) ([]storeEntry, storeIdentity, error) {
 // ownStoreDisk is the on-disk path of a store-relative path.
 func ownStoreDisk(cfg *Config, rel string) string {
 	return filepath.Join(cfg.StoresRoot, filepath.FromSlash(rel))
-}
-
-// sortedGroups returns the ids sorted, for a stable identity.
-func sortedGroups(ids []int) []uint32 {
-	out := make([]uint32, 0, len(ids))
-	for _, id := range ids {
-		if id >= 0 {
-			out = append(out, uint32(id))
-		}
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
-	return out
 }

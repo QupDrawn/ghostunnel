@@ -7,8 +7,10 @@ package ringtrace
 //
 // A decision stands (is reused by a Check) while all of these hold:
 //   - no change notification has arrived since the scan that made it
-//     (the OS watcher bumps a generation on every event; a queue overflow
-//     or a watcher error bumps it too, so nothing lost goes unnoticed);
+//     (the OS watcher bumps a generation on every event that may touch
+//     what the gate reads, watch_windows.go says which those are on
+//     Windows; a queue overflow or a watcher error bumps it too, so
+//     nothing lost goes unnoticed);
 //   - it is younger than Window, or the watcher is running without error
 //     and it is younger than MaxAge, the interval at which the caller's
 //     watch calls Scan and refreshes it regardless;

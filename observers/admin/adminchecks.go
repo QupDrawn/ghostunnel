@@ -175,11 +175,11 @@ func (c AdminChecks) Run(cfg *Config, st *State, peers map[string]PeerView) []Fi
 	}
 	if err != nil {
 		out = append(out, traceConsistentUnread()...)
-		out = append(out, bootAmbiguousFindings(cfg.TracesRoot, listing, live)...)
+		out = append(out, bootAmbiguousFindings(cfg.TracesRoot, listing, live, startLineMemo(st))...)
 	} else {
 		previous := st.TraceBoot
 		out = append(out, traceConsistentFindings(st, boot)...)
-		out = append(out, bootAmbiguousFindings(cfg.TracesRoot, listing, live)...)
+		out = append(out, bootAmbiguousFindings(cfg.TracesRoot, listing, live, startLineMemo(st))...)
 		out = append(out, bootEndedFindings(st, cfg.TracesRoot, previous, boot, cfg.Now, c.TunnelMargins.TickMaxAge)...)
 	}
 	out = append(out, surfaceDisagreements(surfaceAdmin, boot, readable, cfg.Now, c.TunnelMargins, substanceJudgeFor(cfg, st), peers)...)

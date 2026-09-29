@@ -52,15 +52,9 @@ func (env *Environment) signalHandler(p *proxy.Proxy) {
 
 		env.status.Stopping()
 
-		// Best-effort graceful shutdown of status listener
-		if env.statusHTTP != nil {
-			go func() {
-				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				defer cancel()
-				//nolint:errcheck
-				env.statusHTTP.Shutdown(ctx)
-			}()
-		}
+		// Best-effort graceful shutdown of status listener; closeRing waits
+		// for it.
+		go env.stopStatus()
 
 		// Force-exit after timeout
 		time.AfterFunc(env.shutdownTimeout, func() {
@@ -106,11 +100,67 @@ func (env *Environment) signalHandler(p *proxy.Proxy) {
 	}
 }
 
-func (env *Environment) reloadHandler(interval time.Duration) {
-	if interval == 0 {
+// statusShutdownGrace bounds the status listener's graceful shutdown.
+const statusShutdownGrace = 5 * time.Second
+
+// stopStatus shuts the status listener down gracefully, waiting at most
+// statusShutdownGrace for its handlers, once; a later call waits for the
+// first to return.
+func (env *Environment) stopStatus() {
+	env.statusStopOnce.Do(func() {
+		if env.statusHTTP == nil {
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), statusShutdownGrace)
+		defer cancel()
+		//nolint:errcheck
+		env.statusHTTP.Shutdown(ctx)
+	})
+}
+
+// startReloads starts the timed reload loop, every interval, unless the
+// interval is not positive.
+func (env *Environment) startReloads(interval time.Duration) {
+	if interval <= 0 {
 		return
 	}
-	for range time.Tick(interval) {
+	env.reloadStop = make(chan struct{})
+	env.reloads.Add(1)
+	go func() {
+		defer env.reloads.Done()
+		env.reloadHandler(interval, env.reloadStop)
+	}()
+}
+
+// stopReloads ends the timed reload loop and waits for it to return, a
+// reload in progress included.
+func (env *Environment) stopReloads() {
+	env.reloadStopOnce.Do(func() {
+		if env.reloadStop != nil {
+			close(env.reloadStop)
+		}
+	})
+	env.reloads.Wait()
+}
+
+// closeRing closes the observer ring once nothing else can record: the
+// timed reloads have stopped and the status listener's handlers have
+// returned, or its graceful shutdown ran out.
+func (env *Environment) closeRing() {
+	env.stopReloads()
+	env.stopStatus()
+	env.ring.close()
+}
+
+func (env *Environment) reloadHandler(interval time.Duration, stop <-chan struct{}) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+		}
 		env.reload()
 	}
 }

@@ -62,17 +62,19 @@ var structuralLocal = map[string]bool{
 	"postcondition":        true,
 }
 
-// isLocal reports whether a failing check belongs in the fault file.
-func isLocal(cfg *Config, check string) bool {
-	if structuralLocal[check] {
-		return true
+// localSet is every check whose failure belongs in the fault file: the
+// structural ones above and each identifier the member's local checks
+// declare. It is built once per cycle (buildFault) and judges every
+// finding of that cycle.
+func localSet(cfg *Config) map[string]bool {
+	out := make(map[string]bool, len(structuralLocal))
+	for id := range structuralLocal {
+		out[id] = true
 	}
 	if cfg.Local != nil {
 		for _, id := range cfg.Local.Identifiers() {
-			if id == check {
-				return true
-			}
+			out[id] = true
 		}
 	}
-	return false
+	return out
 }

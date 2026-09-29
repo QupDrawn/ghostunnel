@@ -54,7 +54,8 @@ type ConnObserver interface {
 	// dial succeeded; on a failed dial its return value is not consulted,
 	// the connection is closed for the dial error.
 	Dialed(backend net.Conn, err error) error
-	// Closed is called exactly once, after the connection is closed.
+	// Closed is called exactly once, after the connection is closed and
+	// before Proxy.Wait can return.
 	Closed(reason CloseReason)
 }
 

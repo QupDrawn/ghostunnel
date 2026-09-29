@@ -168,7 +168,7 @@ func newCertmagicConfig(renewCheckInterval time.Duration) *certmagic.Config {
 }
 
 func newACMETLSConfigSource(magicConfig *certmagic.Config, acme *ACMEConfig) (*acmeTLSConfigSource, error) {
-	trustStore, err := LoadTrustStore(acme.CABundlePath)
+	trustStore, caBytes, err := loadTrustStore(acme.CABundlePath)
 	if err != nil {
 		return nil, err
 	}
@@ -179,6 +179,7 @@ func newACMETLSConfigSource(magicConfig *certmagic.Config, acme *ACMEConfig) (*a
 		caBundlePath: acme.CABundlePath,
 	}
 	source.cachedTrustStore.Store(trustStore)
+	source.loaded.Store(&LoadedFiles{CABundlePath: acme.CABundlePath, CABundle: caBytes})
 
 	return source, nil
 }
@@ -189,18 +190,27 @@ type acmeTLSConfigSource struct {
 	caBundlePath string
 	// Cached *x509.CertPool
 	cachedTrustStore atomic.Pointer[x509.CertPool]
+	// loaded is the CA bundle file of the last successful load; the
+	// certificate is certmagic's and has no file here.
+	loaded atomic.Pointer[LoadedFiles]
 }
 
 func (a *acmeTLSConfigSource) Reload() error {
 	// certmagic automatically keeps certs updated, but we need to
 	// reload the trust store (CA bundle) from disk.
-	bundle, err := LoadTrustStore(a.caBundlePath)
+	bundle, caBytes, err := loadTrustStore(a.caBundlePath)
 	if err != nil {
 		return err
 	}
 
 	a.cachedTrustStore.Store(bundle)
+	a.loaded.Store(&LoadedFiles{CABundlePath: a.caBundlePath, CABundle: caBytes})
 	return nil
+}
+
+// LoadedFiles implements FileMaterialSource: the CA bundle only.
+func (a *acmeTLSConfigSource) LoadedFiles() (*LoadedFiles, bool) {
+	return a.loaded.Load(), true
 }
 
 func (a *acmeTLSConfigSource) getTrustStore() *x509.CertPool {

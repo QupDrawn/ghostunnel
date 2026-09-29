@@ -84,7 +84,7 @@ func TestReadPKCS12ED25519(t *testing.T) {
 	tmpFile.Close()
 
 	// Read back using our readCertificateFile function
-	blocks, err := readCertificateFile(tmpFile.Name(), password, "")
+	blocks, _, err := readCertificateFile(tmpFile.Name(), password, "")
 	assert.NoError(t, err, "should read PKCS#12 file with ED25519 key")
 	assert.NotEmpty(t, blocks, "should have PEM blocks")
 

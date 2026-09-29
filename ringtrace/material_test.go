@@ -71,8 +71,8 @@ func TestWriteMaterialWritesOnce(t *testing.T) {
 	if !info1.ModTime().Equal(info2.ModTime()) || info1.Size() != info2.Size() {
 		t.Fatal("the second write touched the file")
 	}
-	if mode := info2.Mode().Perm(); runtime.GOOS != "windows" && mode != 0o644 {
-		t.Fatalf("file mode %o, want 0644", mode)
+	if mode := info2.Mode().Perm(); runtime.GOOS != "windows" && mode != FileMode {
+		t.Fatalf("file mode %o, want %o", mode, FileMode)
 	}
 
 	other, err := WriteMaterial(root, append([]byte{}, bundle[:len(bundle)-1]...))

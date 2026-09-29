@@ -5,9 +5,10 @@ package main
 // 10,000 and 100,000 lines of one boot. The trace work of step 7 is done
 // here as every member does it (the tunnel surface, tick-fresh,
 // trace-consistent and the surface comparison; no host probe), once with
-// every line decoded every cycle (full) and once with the decode memory
-// (memory: the lines beyond what last cycle decoded). Every member carries
-// a byte-identical copy of this file.
+// every line decoded and judged every cycle (full) and once with the
+// decode memory and the kept judgement (memory: the lines beyond what last
+// cycle decoded and judged). Every member carries a byte-identical copy of
+// this file.
 
 import (
 	"fmt"
@@ -18,7 +19,7 @@ import (
 )
 
 // benchTraceChecks is step 7's trace work. Full selects the read that
-// decodes every line.
+// decodes every line, which no judgement is kept across.
 type benchTraceChecks struct {
 	Full bool
 }
@@ -50,8 +51,7 @@ func (c benchTraceChecks) Run(cfg *Config, st *State, peers map[string]PeerView)
 		out = append(out, tickFreshUnread()...)
 		out = append(out, traceConsistentFindings(st, boot)...)
 	default:
-		out = tunnelSurfaceFindings(boot, cfg.Now, 0, 0, 0)
-		out = append(out, substanceFindings(boot, substanceJudgeFor(cfg, st))...)
+		out = tunnelFindings(boot, cfg.Now, surfaceMargins{}, substanceJudgeFor(cfg, st))
 		out = append(out, tickFreshFindings(boot, cfg.Now, 0)...)
 		out = append(out, traceConsistentFindings(st, boot)...)
 	}
@@ -143,7 +143,8 @@ func TestBenchRingTraceIsHealthy(t *testing.T) {
 
 // BenchmarkCycle is one cycle of this member at three trace sizes, the
 // trace unchanged between cycles (no new connection), with every line
-// decoded (full) and with the decode memory (memory).
+// decoded and judged (full) and with the decode memory and the kept
+// judgement (memory).
 func BenchmarkCycle(b *testing.B) {
 	for _, n := range []int{300, 10000, 100000} {
 		for _, mode := range []string{"full", "memory"} {

@@ -22,10 +22,21 @@ import (
 // whole seconds.
 const timestampLayout = "2006-01-02T15:04:05Z"
 
-var (
-	reHash    = regexp.MustCompile(`^[0-9a-f]{64}$`)
-	reInteger = regexp.MustCompile(`^-?(0|[1-9][0-9]*)$`)
-)
+var reInteger = regexp.MustCompile(`^-?(0|[1-9][0-9]*)$`)
+
+// isHash reports whether s is a lower-case SHA-256 hex string: exactly 64
+// bytes, each 0-9 or a-f.
+func isHash(s string) bool {
+	if len(s) != 64 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
 
 // rawObject holds a decoded object's raw values by key, and the key order.
 type rawObject struct {
@@ -207,7 +218,7 @@ func nullableHash(raw json.RawMessage, name string) (*string, error) {
 	if err != nil {
 		return nil, err
 	}
-	if s != nil && !reHash.MatchString(*s) {
+	if s != nil && !isHash(*s) {
 		return nil, fmt.Errorf("%s: not a lower-case SHA-256 hex string", name)
 	}
 	return s, nil

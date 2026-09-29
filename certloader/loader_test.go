@@ -66,7 +66,7 @@ func TestReadPEMValid(t *testing.T) {
 	_, err = cert.Write([]byte(testCertificate))
 	assert.Nil(t, err, "temp file error")
 
-	blocks, err := readCertificateFile(cert.Name(), "", "PEM")
+	blocks, _, err := readCertificateFile(cert.Name(), "", "PEM")
 	assert.Nil(t, err, "should read PEM file")
 	assert.Len(t, blocks, 1, "should find one PEM block")
 }
@@ -79,11 +79,11 @@ func TestReadPEMInvalid(t *testing.T) {
 	_, err = cert.Write([]byte("invalid"))
 	assert.Nil(t, err, "temp file error")
 
-	blocks, err := readCertificateFile(cert.Name(), "", "PEM")
+	blocks, _, err := readCertificateFile(cert.Name(), "", "PEM")
 	assert.NotNil(t, err, "should not parse invalid file")
 	assert.Len(t, blocks, 0, "should not return PEM blocks")
 
-	blocks, err = readCertificateFile("does-not-exist", "", "PEM")
+	blocks, _, err = readCertificateFile("does-not-exist", "", "PEM")
 	assert.NotNil(t, err, "should not parse invalid file")
 	assert.Len(t, blocks, 0, "should not return PEM blocks")
 }
@@ -138,7 +138,7 @@ func TestReadPEMFormatError(t *testing.T) {
 	require.NoError(t, err)
 	tmp.Close()
 
-	_, err = readCertificateFile(tmp.Name(), "", "")
+	_, _, err = readCertificateFile(tmp.Name(), "", "")
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "failed to detect format")
 }
@@ -150,7 +150,7 @@ func TestReadPEMNoCertsFound(t *testing.T) {
 	defer os.Remove(tmp.Name())
 	tmp.Close()
 
-	_, err = readCertificateFile(tmp.Name(), "", "PEM")
+	_, _, err = readCertificateFile(tmp.Name(), "", "PEM")
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "no certificates found")
 }

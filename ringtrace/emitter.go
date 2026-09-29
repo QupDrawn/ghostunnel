@@ -78,6 +78,11 @@ type Emitter struct {
 	lastAt  time.Time // the timestamp of the last line written
 	closed  bool
 	failed  error
+	// enc is the buffer append encodes a batch into, reused from batch to
+	// batch under mu: the write copies it into the segment before append
+	// returns, so none of its bytes outlive the call. One grown beyond
+	// maxEncodeBytes by a large batch is not kept.
+	enc []byte
 	// lock is gt/lock, held exclusively for the emitter's lifetime so no
 	// second emitter opens under the same root.
 	lock *os.File
@@ -498,17 +503,25 @@ func (e *Emitter) append(bodies []Body) (first int64, b *syncBatch, leader bool,
 			// A clock that runs backwards is a clock that cannot be read.
 			return 0, nil, false, nil, e.fail(fmt.Errorf("ringtrace: clock went back from %s to %s", formatTimestamp(e.lastAt), formatTimestamp(now)))
 		}
-		// The batch is encoded into one buffer, sized for its lines
-		// (AppendLine): a line that does not fit grows it, and the
-		// bytes are those EncodeLine would give line by line.
-		buf := make([]byte, 0, lineSizeHint*len(bodies))
+		// The batch is encoded into the emitter's one encode buffer, at
+		// least sized for its lines: a line that does not fit grows it,
+		// and the bytes are those EncodeLine would give line by line.
+		// Every line of the batch carries now, formatted once.
+		if cap(e.enc) < lineSizeHint*len(bodies) {
+			e.enc = make([]byte, 0, lineSizeHint*len(bodies))
+		}
+		var ts [len(timestampLayout)]byte
+		at := now.AppendFormat(ts[:0], timestampLayout)
+		buf := e.enc[:0]
 		for i, body := range bodies {
 			var err error
-			buf, err = AppendLine(buf, Record{Sequence: e.next + int64(i), At: now, Body: body})
+			buf, err = appendLine(buf, Record{Sequence: e.next + int64(i), At: now, Body: body}, at)
 			if err != nil {
+				e.keepEncode(buf)
 				return 0, nil, false, nil, err
 			}
 		}
+		e.keepEncode(buf)
 		if e.segSize > 0 && e.segSize+int64(len(buf)) > e.opts.MaxSegmentBytes {
 			if in := e.inflight; in != nil {
 				// The segment cannot be closed under a running fsync. Wait
@@ -546,6 +559,20 @@ func (e *Emitter) append(bodies []Body) (first int64, b *syncBatch, leader bool,
 		}
 		return first, e.batch, leader, e.inflight, nil
 	}
+}
+
+// maxEncodeBytes is the largest encode buffer the emitter keeps for the
+// next batch.
+const maxEncodeBytes = 64 << 10
+
+// keepEncode keeps buf as the encode buffer for the next batch, unless a
+// large batch grew it past maxEncodeBytes. The caller holds e.mu.
+func (e *Emitter) keepEncode(buf []byte) {
+	if cap(buf) > maxEncodeBytes {
+		e.enc = nil
+		return
+	}
+	e.enc = buf[:0]
 }
 
 // commit is the leader's half of the group commit: once the fsync that
@@ -673,11 +700,13 @@ func (e *Emitter) releaseLock() {
 
 // syncDir fsyncs a directory so a created entry is durable. Windows has no
 // directory fsync; there the call is a no-op, which the README records.
+// The directory is opened by openDir, which refuses anything else at the
+// name without waiting on it.
 func syncDir(path string) error {
 	if runtime.GOOS == "windows" {
 		return nil
 	}
-	d, err := os.Open(path)
+	d, err := openDir(path)
 	if err != nil {
 		return err
 	}

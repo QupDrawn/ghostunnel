@@ -3,7 +3,9 @@ package ringtrace
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -269,11 +271,72 @@ func TestGateRefusesUnreadableTree(t *testing.T) {
 	expectRefuse(t, testGate(root), "halt is a directory")
 }
 
+// A root or a store that is not a directory is refused by the reads under
+// it: a regular file in its place, or a link to nothing.
+func TestGateRefusesARootOrStoreThatIsNotADirectory(t *testing.T) {
+	t.Run("file", func(t *testing.T) {
+		file := filepath.Join(t.TempDir(), "stores")
+		writeRaw(t, file, "x")
+		expectRefuse(t, testGate(file), "root is a file")
+		for _, m := range []string{"admin", "material", "super", "tunnel"} {
+			root := healthyTree(t)
+			if err := os.RemoveAll(filepath.Join(root, m)); err != nil {
+				t.Fatal(err)
+			}
+			writeRaw(t, filepath.Join(root, m), "x")
+			d := expectRefuse(t, testGate(root), m+" store is a file")
+			if !strings.Contains(d.Reason, m+"/") {
+				t.Fatalf("%s store is a file: the reason must name the store: %s", m, d.Reason)
+			}
+		}
+	})
+	t.Run("dangling link", func(t *testing.T) {
+		dangling := filepath.Join(t.TempDir(), "stores")
+		danglingLink(t, dangling)
+		expectRefuse(t, testGate(dangling), "root is a dangling link")
+		for _, m := range []string{"admin", "material", "super", "tunnel"} {
+			root := healthyTree(t)
+			if err := os.RemoveAll(filepath.Join(root, m)); err != nil {
+				t.Fatal(err)
+			}
+			danglingLink(t, filepath.Join(root, m))
+			d := expectRefuse(t, testGate(root), m+" store is a dangling link")
+			if !strings.Contains(d.Reason, m+"/") {
+				t.Fatalf("%s store is a dangling link: the reason must name the store: %s", m, d.Reason)
+			}
+		}
+	})
+}
+
+// danglingLink makes link a link to a directory that does not exist: a
+// symbolic link, or on Windows without the privilege for one a junction,
+// which needs none.
+func danglingLink(t *testing.T, link string) {
+	t.Helper()
+	target := filepath.Join(filepath.Dir(link), "nothing")
+	err := os.Symlink(target, link)
+	if err == nil {
+		return
+	}
+	if runtime.GOOS != "windows" {
+		t.Fatal(err)
+	}
+	if out, jerr := exec.Command("cmd", "/c", "mklink", "/J", link, target).CombinedOutput(); jerr != nil {
+		t.Skipf("neither a symbolic link (%v) nor a junction (%v: %s) can be made here", err, jerr, out)
+	}
+}
+
 func TestGateRefusesBadConfiguration(t *testing.T) {
 	root := healthyTree(t)
 	g := testGate(root)
 	g.MaxHeartbeatAge = 0
 	expectRefuse(t, g, "zero max age")
+	// An empty root is not the working directory, even one that holds a
+	// healthy tree.
+	t.Chdir(root)
+	g = testGate(root)
+	g.Root = ""
+	expectRefuse(t, g, "no root")
 	g = testGate(root)
 	g.Members = nil
 	expectRefuse(t, g, "no members")

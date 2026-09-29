@@ -1152,6 +1152,55 @@ func TestSubstancePolicyCompilationIsRemembered(t *testing.T) {
 	subWant(t, subRun(t, root, j), aclFail(1))
 }
 
+// A verdict the policy gave is remembered and still answered only once the
+// policy file reads and hashes clean on the cycle: the file changed,
+// removed, or made a directory after the verdict was remembered fails the
+// line, as a first judgement of it does; put back, it passes again.
+func TestSubstanceRememberedPolicyVerdictReadsThePolicy(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join(gtPKI, "policy.rego"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := t.TempDir()
+	path := filepath.Join(base, "policy.rego")
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	acl := []string{"policy:" + gtPolicyHash}
+	material := []string{subCA, `{"material":"policy","path":"policy.rego","sha256":"` + gtPolicyHash + `"}`}
+	lines := append([]string{subStart(subAt, 1, subConfig(acl, material...))}, subServed(subAt, 1, gtChainClient, "policy")...)
+	root := subTree(t, lines...)
+	j := substanceJudgeFor(&Config{PolicyQuery: gtPolicyQueryPKI, MaterialBase: base}, &State{})
+	subWant(t, subRun(t, root, j))
+	if len(j.Cache.rules) == 0 {
+		t.Fatal("the policy's verdict was not remembered")
+	}
+	breaks := []func() error{
+		func() error { return os.WriteFile(path, append(append([]byte{}, data...), '\n'), 0o644) },
+		func() error { return nil },
+		func() error { return os.Mkdir(path, 0o755) },
+	}
+	for i, broken := range breaks {
+		if err := os.RemoveAll(path); err != nil {
+			t.Fatal(err)
+		}
+		if err := broken(); err != nil {
+			t.Fatal(err)
+		}
+		if got := subRun(t, root, j); fmt.Sprint(got) != fmt.Sprint([]Finding{aclFail(1)}) {
+			t.Fatalf("break %d: %v with the verdict remembered, want %v", i, got, aclFail(1))
+		}
+		subWant(t, subRun(t, root, substanceJudge{PolicyQuery: gtPolicyQueryPKI, MaterialBase: base}), aclFail(1))
+		if err := os.RemoveAll(path); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		subWant(t, subRun(t, root, j))
+	}
+}
+
 // ---- the surface ----
 
 func TestSubstanceIsJudgedForSurfaceDisagree(t *testing.T) {

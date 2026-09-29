@@ -48,6 +48,17 @@ func (c *certTLSConfigSource) Reload() error {
 	return err
 }
 
+// LoadedFiles implements FileMaterialSource for a certificate that keeps
+// the files it was loaded from (PEM files, a keystore, a CA bundle alone).
+func (c *certTLSConfigSource) LoadedFiles() (*LoadedFiles, bool) {
+	if files, ok := c.cert.(fileCertificate); ok {
+		if loaded := files.loadedFiles(); loaded != nil {
+			return loaded, true
+		}
+	}
+	return nil, false
+}
+
 func (c *certTLSConfigSource) CanServe() bool {
 	cert, _ := c.cert.GetCertificate(nil)
 	return cert != nil && cert.PrivateKey != nil

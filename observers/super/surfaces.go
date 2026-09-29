@@ -76,12 +76,12 @@ func surfaceIdentifiers(owner string) []string {
 
 // surfaceFindings judges a readable current boot with a start line by a
 // surface's rules. sub is what the tunnel surface's substance rules need
-// beyond the boot (substance.go).
+// beyond the boot (substance.go), with the tunnel surface's judgement kept
+// across cycles (judgememory.go).
 func surfaceFindings(owner string, boot *gtBoot, now time.Time, m surfaceMargins, sub substanceJudge) []Finding {
 	switch owner {
 	case surfaceTunnel:
-		out := tunnelSurfaceFindings(boot, now, m.LifetimeMargin, m.ACLGrace, m.TickMaxAge)
-		return append(out, substanceFindings(boot, sub)...)
+		return tunnelFindings(boot, now, m, sub)
 	case surfaceAdmin:
 		return adminSurfaceFindings(boot)
 	case surfaceMaterial:

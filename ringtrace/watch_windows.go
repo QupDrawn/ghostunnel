@@ -11,13 +11,24 @@ package ringtrace
 // began is seen by it. A completion with no bytes is the kernel saying its
 // buffer overflowed: reported as such, the scan that follows sees what was
 // missed.
+//
+// The subtree holds more than the gate reads: the trace root gt/ when it
+// sits under the stores, every store's copies, and the heartbeat/ of every
+// store but the coordinator's. A notification is reported unless its path
+// is one the gate provably never reads (notifyFilter); everything else, a
+// name it does not recognise included, is reported.
 
 import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
+	"unicode/utf16"
 	"unsafe"
 )
 
@@ -37,18 +48,27 @@ const (
 	errorNotifyEnumDir       = syscall.Errno(1022)
 )
 
+// rdcBufferBytes is the size of the buffer the kernel reports changes
+// into; a batch that does not fit is reported as an overflow. A variable
+// for the test that makes every notification overflow it.
+var rdcBufferBytes = 64 * 1024
+
 type rdcWatcher struct {
-	s   *GateState
-	h   syscall.Handle
-	ev  syscall.Handle
-	ov  syscall.Overlapped
-	buf []byte
+	s      *GateState
+	filter *notifyFilter
+	h      syscall.Handle
+	ev     syscall.Handle
+	ov     syscall.Overlapped
+	buf    []byte
 	// mu serialises the completion's handling and the next issue between
 	// the goroutine and the polls.
 	mu      sync.Mutex
 	pending bool
 	closed  bool
 	done    chan struct{}
+	// ignored counts the notifications the filter did not count (a seam
+	// for tests that wait on it).
+	ignored atomic.Int64
 }
 
 func startWatcher(root string, dirs []string, s *GateState) (treeWatcher, error) {
@@ -67,7 +87,7 @@ func startWatcher(root string, dirs []string, s *GateState) (treeWatcher, error)
 		_ = syscall.CloseHandle(h)
 		return nil, fmt.Errorf("CreateEventW: %w", e)
 	}
-	w := &rdcWatcher{s: s, h: h, ev: syscall.Handle(r), buf: make([]byte, 64*1024), done: make(chan struct{})}
+	w := &rdcWatcher{s: s, filter: newNotifyFilter(root, s.Gate), h: h, ev: syscall.Handle(r), buf: make([]byte, rdcBufferBytes), done: make(chan struct{})}
 	w.ov.HEvent = w.ev
 	if err := w.issue(); err != nil {
 		_ = syscall.CloseHandle(w.ev)
@@ -139,17 +159,23 @@ func (w *rdcWatcher) consumeLocked() bool {
 	w.pending = false
 	switch {
 	case err == nil && n == 0, errors.Is(err, errorNotifyEnumDir):
+		w.filter.recheckAll()
 		w.s.overflow()
 	case errors.Is(err, syscall.ERROR_OPERATION_ABORTED):
 		// The read was cancelled under us (the thread that issued it is
 		// gone): whatever happened meanwhile is unknown, so the state is
 		// stale and the read is reissued.
+		w.filter.recheckAll()
 		w.s.overflow()
 	case err != nil:
 		w.s.watchFailed(fmt.Errorf("GetOverlappedResult: %w", err))
 		return false
 	default:
-		w.s.event(countNotifications(w.buf[:n]))
+		c, ignored := countNotifications(w.buf[:n], w.filter)
+		w.ignored.Add(int64(ignored))
+		if c > 0 {
+			w.s.event(c)
+		}
 	}
 	if err := w.issue(); err != nil {
 		w.s.watchFailed(fmt.Errorf("ReadDirectoryChangesW: %w", err))
@@ -158,21 +184,193 @@ func (w *rdcWatcher) consumeLocked() bool {
 	return true
 }
 
-// countNotifications walks a FILE_NOTIFY_INFORMATION chain.
-func countNotifications(b []byte) int {
-	n := 0
+// countNotifications walks a FILE_NOTIFY_INFORMATION chain and returns how
+// many of its notifications the filter counts and how many it does not. An
+// entry whose name runs past the buffer is counted and ends the walk, and a
+// buffer holding no whole entry counts once: what cannot be read is a
+// change.
+func countNotifications(b []byte, f *notifyFilter) (n, ignored int) {
+	entries := 0
 	for off := 0; off+12 <= len(b); {
-		n++
+		entries++
 		next := int(binary.LittleEndian.Uint32(b[off : off+4]))
+		size := int(binary.LittleEndian.Uint32(b[off+8 : off+12]))
+		if size%2 != 0 || off+12+size > len(b) {
+			n++
+			break
+		}
+		name := make([]uint16, size/2)
+		for i := range name {
+			name[i] = binary.LittleEndian.Uint16(b[off+12+2*i:])
+		}
+		if f.counts(string(utf16.Decode(name))) {
+			n++
+		} else {
+			ignored++
+		}
 		if next == 0 {
 			break
 		}
 		off += next
 	}
-	if n == 0 {
+	if entries == 0 {
 		n = 1
 	}
-	return n
+	return n, ignored
+}
+
+// notifyFilter tells a notification of a change the gate may read from one
+// of a change it never reads.
+//
+// Gate.Check reads, under the root, <m>\halt, <m>\fault and <m>\halts\ for
+// every member m, and the coordinator's heartbeat\ and the newest file in
+// it. Three kinds of path are not counted, each strictly below an entry of
+// the root or of a store, so a change to an entry on the way to a read is
+// never dropped:
+//   - anything under gt\ (the trace root, when it is under the stores);
+//   - anything under <m>\copy*\ for a member m;
+//   - anything under <m>\heartbeat\ for a member m that is not the
+//     coordinator.
+//
+// Names are matched without regard to case, as the filesystem opens them.
+// A component that is not plain ASCII, or carries a '~' (an 8.3 short name
+// such as HEARTB~1, which the kernel may report in place of the long one),
+// matches nothing, so its path is counted.
+//
+// The kernel reports a change by where it happened, while the gate reads
+// through links: a store, a halts\ or the coordinator's heartbeat\ that is
+// a reparse point (a symbolic link, a junction) may lead into a subtree
+// that is not counted. The filter is therefore on only while each of those
+// directories is a plain directory: checked when the watch starts, again
+// for the directory a notification names as the entry that changed (and
+// for all of them when it names one that cannot be told apart, or when
+// the kernel's buffer overflowed), before the notifications after it are
+// judged. Once one is not, every notification counts until the watch is
+// started again. The same holds, from the start, when a member or the
+// coordinator is not one plain name.
+type notifyFilter struct {
+	on          bool
+	root        string
+	members     []string
+	coordinator string
+	gtIsMember  bool
+}
+
+func newNotifyFilter(root string, g *Gate) *notifyFilter {
+	f := &notifyFilter{}
+	if g == nil || !plainName(g.Coordinator) {
+		return f
+	}
+	for _, m := range g.Members {
+		if !plainName(m) {
+			return f
+		}
+		if strings.EqualFold(m, "gt") {
+			f.gtIsMember = true
+		}
+	}
+	f.root, f.members, f.coordinator = root, append([]string(nil), g.Members...), g.Coordinator
+	f.on = true
+	f.recheckAll()
+	return f
+}
+
+// counts reports whether a change at rel, a path relative to the root as
+// the kernel reports it, may be to something Gate.Check reads.
+func (f *notifyFilter) counts(rel string) bool {
+	if !f.on {
+		return true
+	}
+	first, rest, deeper := strings.Cut(rel, `\`)
+	if !plainName(first) {
+		f.recheckAll()
+		return true
+	}
+	if strings.EqualFold(first, "gt") && !f.gtIsMember {
+		return !deeper
+	}
+	if !f.isMember(first) {
+		return true
+	}
+	if !deeper {
+		f.recheck(first)
+		return true
+	}
+	second, _, deeper := strings.Cut(rest, `\`)
+	if !plainName(second) {
+		f.recheckAll()
+		return true
+	}
+	coordinator := strings.EqualFold(first, f.coordinator)
+	if strings.EqualFold(second, "halts") || coordinator && strings.EqualFold(second, "heartbeat") {
+		if !deeper {
+			f.recheck(first + `\` + second)
+		}
+		return true
+	}
+	if !deeper {
+		return true
+	}
+	if len(second) >= 4 && strings.EqualFold(second[:4], "copy") {
+		return false
+	}
+	if !coordinator && strings.EqualFold(second, "heartbeat") {
+		return false
+	}
+	return true
+}
+
+func (f *notifyFilter) isMember(name string) bool {
+	for _, m := range f.members {
+		if strings.EqualFold(name, m) {
+			return true
+		}
+	}
+	return false
+}
+
+// recheck turns the filter off unless the directory at rel under the root
+// is a plain directory.
+func (f *notifyFilter) recheck(rel string) {
+	if f.on && !plainDir(filepath.Join(f.root, rel)) {
+		f.on = false
+	}
+}
+
+// recheckAll is recheck on every directory the gate reads through: each
+// store, each store's halts\, and the coordinator's heartbeat\.
+func (f *notifyFilter) recheckAll() {
+	for _, m := range f.members {
+		f.recheck(m)
+		f.recheck(m + `\halts`)
+	}
+	f.recheck(f.coordinator + `\heartbeat`)
+}
+
+// plainDir reports whether path is a directory and not a reparse point.
+func plainDir(path string) bool {
+	info, err := os.Lstat(path)
+	if err != nil || !info.IsDir() || info.Mode()&(os.ModeSymlink|os.ModeIrregular) != 0 {
+		return false
+	}
+	a, ok := info.Sys().(*syscall.Win32FileAttributeData)
+	return ok && a.FileAttributes&syscall.FILE_ATTRIBUTE_REPARSE_POINT == 0
+}
+
+// plainName is a single path component the filter can match: not empty,
+// not . or .., printable ASCII with no separator, drive or stream colon,
+// wildcard or '~'.
+func plainName(s string) bool {
+	if s == "" || s == "." || s == ".." {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c <= ' ' || c >= 0x7f || strings.IndexByte(`\/:*?"<>|~`, c) >= 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func getOverlappedResult(h syscall.Handle, ov *syscall.Overlapped, n *uint32, wait bool) error {

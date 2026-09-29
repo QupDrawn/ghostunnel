@@ -7,7 +7,11 @@ benchmarks unless told `-skip-gobench`. It is its own Go module, nested
 here so its build stays out of the main module and `vendor/`.
 
 Nothing leaves the machine unless you point it at a remote echo. It writes
-only under its work directory.
+only under its work directory. An interrupt (Ctrl-C, and on unix a
+terminate or the hangup of a closed ssh session) stops every process the
+run started, both proxies and the `go test` of the Go benchmarks, before
+the tool exits; on Linux the proxies also die with the tool if it is
+killed outright.
 
 ## Run
 
@@ -159,8 +163,8 @@ Both apply to base and fork alike. Put them in a file under
 **Landlock enforced, on Linux.** The fork starts on Linux without an
 acceptance flag only when the kernel enforces landlock:
 `cat /sys/kernel/security/lsm` must list `landlock`. Otherwise the fork
-refuses to start and the report carries the gate's reason. Off Linux the
-tool passes `--accept-no-sandbox=<GOOS>` itself.
+refuses to start and the report carries the tail of its log, which names
+the reason. Off Linux the tool passes `--accept-no-sandbox=<GOOS>` itself.
 
 **A second host for the echo, when the dial should cross the network.**
 Build the tool there, run `go -C bench run . -serve-echo :9000` (or build
@@ -212,8 +216,9 @@ anything else is refused before ssh or scp runs. On Windows, Git Bash
 rewrites an argument such as `/var/lib/x` into a Windows path before the
 tool sees it, which that check catches; set `MSYS_NO_PATHCONV=1` for the
 command. The run stays in the foreground of the ssh session: closing the
-session kills it. A run that must outlive this machine is started on the
-remote host with `nohup` and collected afterwards with `-latest`.
+session ends it and the processes it started. A run that must outlive this
+machine is started on the remote host with `nohup` and collected afterwards
+with `-latest`.
 
 ## Preparing a remote host
 

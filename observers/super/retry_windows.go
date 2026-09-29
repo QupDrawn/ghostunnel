@@ -97,13 +97,13 @@ func readRetrying(read func() error) error {
 	return withRetry(read)
 }
 
-// readFile returns the bytes of p, retrying a sharing violation within the
-// budget.
+// readFile returns the bytes of the regular file p names (readRegularFile),
+// retrying a sharing violation within the budget.
 func readFile(p string) ([]byte, error) {
 	var data []byte
 	err := readRetrying(func() error {
 		var err error
-		data, err = os.ReadFile(p)
+		data, err = readRegularFile(p)
 		return err
 	})
 	return data, err

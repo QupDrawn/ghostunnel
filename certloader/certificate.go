@@ -44,6 +44,27 @@ func (b *baseCertificate) GetTrustStore() *x509.CertPool {
 	return b.cachedCertPool.Load()
 }
 
+// LoadedFiles is what a load read from files for the material in use, byte
+// for byte: the bytes each file had when it was read, which are the bytes
+// that were parsed, never a later read of the same path. A path is empty,
+// and its bytes nil, where the material did not come from such a file: a
+// certificate from a keystore (which holds the key too) or from no file,
+// the system trust store.
+type LoadedFiles struct {
+	// CertificatePath and Certificate are the PEM certificate file.
+	CertificatePath string
+	Certificate     []byte
+	// CABundlePath and CABundle are the CA bundle file.
+	CABundlePath string
+	CABundle     []byte
+}
+
+// fileCertificate is a Certificate that keeps the files of its last
+// successful load.
+type fileCertificate interface {
+	loadedFiles() *LoadedFiles
+}
+
 // GetIdentifier returns an identifier for the certificate for logging.
 func (b *baseCertificate) GetIdentifier() string {
 	return b.cachedCertificate.Load().Leaf.Subject.String()

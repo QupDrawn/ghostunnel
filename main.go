@@ -30,6 +30,7 @@ import (
 	"runtime"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ghostunnel/ghostunnel/auth"
@@ -273,6 +274,13 @@ type Environment struct {
 	// check reads the first; the second is what a failed Serve is about.
 	proxy          *proxy.Proxy
 	statusListener net.Listener
+	// statusStopOnce runs the status listener's shutdown once (stopStatus);
+	// reloadStop ends the timed reload loop and reloads is that loop,
+	// running (startReloads). closeRing waits on both.
+	statusStopOnce sync.Once
+	reloadStop     chan struct{}
+	reloadStopOnce sync.Once
+	reloads        sync.WaitGroup
 }
 
 // acceptHealthWindow is how recently the accept loop must have come round
@@ -941,7 +949,6 @@ func run(args []string) error {
 			tlsConfigSource: tlsConfigSource,
 			regoPolicy:      regoPolicy,
 		}
-		go env.reloadHandler(*timedReload)
 
 		// Start listening
 		err = serverListen(env, regoPolicy)
@@ -996,7 +1003,6 @@ func run(args []string) error {
 			tlsConfigSource: tlsConfigSource,
 			regoPolicy:      policy,
 		}
-		go env.reloadHandler(*timedReload)
 
 		// Start listening
 		err = clientListen(env)
@@ -1079,20 +1085,23 @@ func serverListen(env *Environment, regoPolicy policy.Policy) error {
 
 	// The observer ring's start line describes the configuration as it is
 	// about to be served, so it is written before the listener binds.
-	ringCfg, ringCA, err := ringConfig("server", *serverListenAddress, *serverForwardAddress, serverProxyProtoMode(), serverConfig.GetServerConfig(), sandboxState(), *serverAllowPolicy,
+	loaded := ringSources{tls: env.tlsConfigSource, policy: regoPolicy, policyPath: *serverAllowPolicy}
+	ringCfg, ringCA, err := ringConfig("server", *serverListenAddress, *serverForwardAddress, serverProxyProtoMode(), serverConfig.GetServerConfig(), sandboxState(), loaded,
 		ringRules{acl: serverACL, uris: *serverAllowedURIs, disableAuth: *serverDisableAuth})
 	if err != nil {
 		logger.Printf("error: unable to record the configuration for the ring trace: %s", err)
 		return err
 	}
-	env.ring, err = openRing(ringCfg, ringCA, serverACL, !*serverDisableAuth, *serverAllowPolicy)
+	env.ring, err = openRing(ringCfg, ringCA, serverACL, !*serverDisableAuth, loaded)
 	if err != nil {
 		return err
 	}
+	// The timed reloads start once there is a ring to record them.
+	env.startReloads(*timedReload)
 
 	listener, err := socket.ParseAndOpen(*serverListenAddress)
 	if err != nil {
-		env.ring.close()
+		env.closeRing()
 		logger.Printf("error trying to listen: %s", err)
 		return err
 	}
@@ -1120,7 +1129,7 @@ func serverListen(env *Environment, regoPolicy policy.Policy) error {
 		err := env.serveStatus()
 		if err != nil {
 			listener.Close()
-			env.ring.close()
+			env.closeRing()
 			logger.Printf("error serving /_status: %s", err)
 			return err
 		}
@@ -1134,7 +1143,7 @@ func serverListen(env *Environment, regoPolicy policy.Policy) error {
 	env.status.HandleWatchdog(env.healthy)
 	env.signalHandler(p)
 	p.Wait()
-	env.ring.close()
+	env.closeRing()
 
 	return nil
 }
@@ -1150,20 +1159,23 @@ func clientListen(env *Environment) error {
 	}
 	// A client dials its backend with no PROXY protocol header: the mode is
 	// a server flag, and the client's start line records off.
-	ringCfg, ringCA, err := ringConfig("client", *clientListenAddress, *clientForwardAddress, proxy.ProxyProtocolOff, nil, sandboxState(), *clientAllowPolicy,
+	loaded := ringSources{tls: env.tlsConfigSource, policy: env.regoPolicy, policyPath: *clientAllowPolicy}
+	ringCfg, ringCA, err := ringConfig("client", *clientListenAddress, *clientForwardAddress, proxy.ProxyProtocolOff, nil, sandboxState(), loaded,
 		ringRules{acl: acl, uris: *clientAllowedURIs, disableAuth: *clientDisableAuth})
 	if err != nil {
 		logger.Printf("error: unable to record the configuration for the ring trace: %s", err)
 		return err
 	}
-	env.ring, err = openRing(ringCfg, ringCA, acl, true, *clientAllowPolicy)
+	env.ring, err = openRing(ringCfg, ringCA, acl, true, loaded)
 	if err != nil {
 		return err
 	}
+	// The timed reloads start once there is a ring to record them.
+	env.startReloads(*timedReload)
 
 	listener, err := socket.ParseAndOpen(*clientListenAddress)
 	if err != nil {
-		env.ring.close()
+		env.closeRing()
 		logger.Printf("error opening socket: %s", err)
 		return err
 	}
@@ -1191,7 +1203,7 @@ func clientListen(env *Environment) error {
 		err := env.serveStatus()
 		if err != nil {
 			listener.Close()
-			env.ring.close()
+			env.closeRing()
 			logger.Printf("error serving /_status: %s", err)
 			return err
 		}
@@ -1205,7 +1217,7 @@ func clientListen(env *Environment) error {
 	env.status.HandleWatchdog(env.healthy)
 	env.signalHandler(p)
 	p.Wait()
-	env.ring.close()
+	env.closeRing()
 
 	return nil
 }
@@ -1218,7 +1230,7 @@ func (env *Environment) attachRing(p *proxy.Proxy) {
 	env.proxy = p
 	p.Observer = env.ring
 	env.status.refusal = env.ring.refusal
-	go env.ring.watch(p)
+	env.ring.startWatch(p)
 }
 
 // verifiedClientCert reports whether the request arrived over TLS with a

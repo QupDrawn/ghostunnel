@@ -66,6 +66,7 @@ func progress(format string, args ...interface{}) {
 }
 
 func main() {
+	watchSignals()
 	if err := run(); err != nil {
 		fmt.Fprintf(os.Stderr, "bench: %v\n", err)
 		os.Exit(1)

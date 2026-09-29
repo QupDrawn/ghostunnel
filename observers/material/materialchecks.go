@@ -156,7 +156,7 @@ func (c MaterialChecks) Run(cfg *Config, st *State, peers map[string]PeerView) [
 	case !readable:
 		out = c.allFail(gtBootName(boot.Number))
 	default:
-		out = c.judge(boot, cfg.Now)
+		out = c.judge(boot, cfg.Now, certificateMemo(st))
 		out = append(out, tickFreshFindings(boot, cfg.Now, c.TunnelMargins.TickMaxAge)...)
 	}
 	live := c.Live
@@ -165,11 +165,11 @@ func (c MaterialChecks) Run(cfg *Config, st *State, peers map[string]PeerView) [
 	}
 	if err != nil {
 		out = append(out, traceConsistentUnread()...)
-		out = append(out, bootAmbiguousFindings(cfg.TracesRoot, listing, live)...)
+		out = append(out, bootAmbiguousFindings(cfg.TracesRoot, listing, live, startLineMemo(st))...)
 	} else {
 		previous := st.TraceBoot
 		out = append(out, traceConsistentFindings(st, boot)...)
-		out = append(out, bootAmbiguousFindings(cfg.TracesRoot, listing, live)...)
+		out = append(out, bootAmbiguousFindings(cfg.TracesRoot, listing, live, startLineMemo(st))...)
 		out = append(out, bootEndedFindings(st, cfg.TracesRoot, previous, boot, cfg.Now, c.TunnelMargins.TickMaxAge)...)
 	}
 	out = append(out, surfaceDisagreements(surfaceMaterial, boot, readable, cfg.Now, c.TunnelMargins, substanceJudgeFor(cfg, st), peers)...)
@@ -179,7 +179,7 @@ func (c MaterialChecks) Run(cfg *Config, st *State, peers map[string]PeerView) [
 // judge is the material member's own view of a readable current boot: the
 // surface's rules, then the disk, the key's privacy and the sandbox, each
 // finding once.
-func (c MaterialChecks) judge(boot *gtBoot, now time.Time) []Finding {
+func (c MaterialChecks) judge(boot *gtBoot, now time.Time, certs *contentMemo[certificateParse]) []Finding {
 	start := boot.Records[0].Start
 	var out []Finding
 	seen := map[Finding]bool{}
@@ -211,16 +211,21 @@ func (c MaterialChecks) judge(boot *gtBoot, now time.Time) []Finding {
 			apply(r.Material)
 		}
 	}
-	for _, f := range materialSurfaceFindings(boot) {
+	// The surface's findings, judged once: reload-succeeded is placed
+	// here and resumption-bound last, in the order the checks are listed.
+	surface := materialSurfaceFindings(boot)
+	for _, f := range surface {
 		if f.Check == checkReloadSucceeded {
 			fail(f.Check, f.Subject)
 		}
 	}
+	certs.begin()
 	for _, k := range order {
-		if !materialOnDisk(loaded[k], now) {
+		if !materialOnDisk(loaded[k], now, certs) {
 			fail(checkMaterialLoaded, k.kind)
 		}
 	}
+	certs.end()
 	for _, subject := range binarySubjects(start.Config.Binary, c.ExpectBinarySHA256) {
 		fail(checkBinaryExpected, subject)
 	}
@@ -245,7 +250,7 @@ func (c MaterialChecks) judge(boot *gtBoot, now time.Time) []Finding {
 	for _, subject := range sandboxSubjects(start.Config.SandboxState, start.Config.SandboxAccepted, c.AcceptNoSandbox, c.GOOS) {
 		fail(checkSandboxApplied, subject)
 	}
-	for _, f := range materialSurfaceFindings(boot) {
+	for _, f := range surface {
 		if f.Check == checkResumptionBound {
 			fail(f.Check, f.Subject)
 		}
@@ -304,8 +309,10 @@ func sandboxSubjects(state string, accepted *string, flag, goos string) []string
 
 // materialOnDisk reports whether one loaded entry is what is on disk: a
 // path, a hash unless it is the key, the file readable with that hash, and
-// a certificate or bundle inside its validity window at now.
-func materialOnDisk(m gtMaterial, now time.Time) bool {
+// a certificate or bundle inside its validity window at now. The file is
+// read and hashed every call; its parse is remembered in certs under that
+// hash (certificatesParse), nil remembering nothing.
+func materialOnDisk(m gtMaterial, now time.Time, certs *contentMemo[certificateParse]) bool {
 	if m.Path == "" {
 		return false
 	}
@@ -321,11 +328,13 @@ func materialOnDisk(m gtMaterial, now time.Time) bool {
 		return false
 	}
 	sum := sha256.Sum256(data)
-	if hex.EncodeToString(sum[:]) != *m.SHA256 {
+	digest := hex.EncodeToString(sum[:])
+	if digest != *m.SHA256 {
 		return false
 	}
 	if m.Material == "cert" || m.Material == "ca" {
-		return certificatesValid(data, now)
+		parse := certs.get(digest, func() certificateParse { return parseCertificates(data) })
+		return parse.validAt(now)
 	}
 	return true
 }
@@ -359,7 +368,7 @@ func binarySubjects(b gtBinary, expect string) []string {
 func binaryDigest(path string) (string, error) {
 	var digest string
 	err := readRetrying(func() error {
-		info, err := os.Lstat(path)
+		info, err := lstatForRead(path)
 		if err != nil {
 			return err
 		}
@@ -369,18 +378,13 @@ func binaryDigest(path string) (string, error) {
 		if info.Size() > maxBinaryBytes {
 			return fmt.Errorf("%s: %d bytes exceeds the bound", path, info.Size())
 		}
-		f, err := os.Open(path)
+		// openRegular holds the handle to the file judged, and a named
+		// pipe put in its place is refused rather than waited on.
+		f, _, err := openRegular(path, info)
 		if err != nil {
 			return err
 		}
 		defer f.Close()
-		opened, err := f.Stat()
-		if err != nil {
-			return err
-		}
-		if !opened.Mode().IsRegular() || !os.SameFile(info, opened) {
-			return fmt.Errorf("%s: the file opened is not the one judged", path)
-		}
 		h := sha256.New()
 		n, err := io.Copy(h, io.LimitReader(f, maxBinaryBytes+1))
 		if err != nil {
@@ -395,21 +399,11 @@ func binaryDigest(path string) (string, error) {
 	return digest, err
 }
 
-// readRegular reads a regular file whole.
+// readRegular reads a regular file whole, following a symbolic link, from a
+// handle held to a regular file (readRegularFile): a named pipe at the path
+// is refused rather than waited on.
 func readRegular(path string) ([]byte, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	info, err := f.Stat()
-	if err != nil {
-		return nil, err
-	}
-	if !info.Mode().IsRegular() {
-		return nil, os.ErrInvalid
-	}
-	return io.ReadAll(f)
+	return readRegularFile(path)
 }
 
 // certificatesValid reports whether data is PEM holding at least one
@@ -417,7 +411,16 @@ func readRegular(path string) ([]byte, error) {
 // window at now. Anything else, including a file with no certificate in it,
 // cannot be judged and is not valid.
 func certificatesValid(data []byte, now time.Time) bool {
-	found := false
+	return certificatesParse(data).validAt(now)
+}
+
+// certificatesParse is what certificatesValid needs of data apart from the
+// clock: the validity window of every CERTIFICATE block in order, and ok
+// when there is at least one and every one parses. It is a function of the
+// bytes alone, which is what lets material-loaded remember it under their
+// SHA-256.
+func certificatesParse(data []byte) certificateParse {
+	var p certificateParse
 	for {
 		var block *pem.Block
 		block, data = pem.Decode(data)
@@ -427,14 +430,38 @@ func certificatesValid(data []byte, now time.Time) bool {
 		if block.Type != "CERTIFICATE" {
 			continue
 		}
-		found = true
 		cert, err := x509.ParseCertificate(block.Bytes)
 		if err != nil {
-			return false
+			return certificateParse{}
 		}
-		if now.Before(cert.NotBefore) || now.After(cert.NotAfter) {
+		p.windows = append(p.windows, [2]time.Time{cert.NotBefore, cert.NotAfter})
+	}
+	p.ok = len(p.windows) > 0
+	return p
+}
+
+// parseCertificates is certificatesParse. It is a variable only so that a
+// test can count the parses material-loaded makes.
+var parseCertificates = certificatesParse
+
+// validAt reports whether the parse is of at least one certificate, all of
+// which parsed, and now is inside every one's validity window.
+func (p certificateParse) validAt(now time.Time) bool {
+	if !p.ok {
+		return false
+	}
+	for _, w := range p.windows {
+		if now.Before(w[0]) || now.After(w[1]) {
 			return false
 		}
 	}
-	return found
+	return true
+}
+
+// certificateMemo is the certificate memory of st, allocated on first use.
+func certificateMemo(st *State) *contentMemo[certificateParse] {
+	if st.Certificates == nil {
+		st.Certificates = &contentMemo[certificateParse]{}
+	}
+	return st.Certificates
 }

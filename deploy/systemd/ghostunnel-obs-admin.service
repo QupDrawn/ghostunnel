@@ -45,7 +45,7 @@ ExecStart=/usr/local/bin/ghostunnel-obs-admin \
     -stores /var/lib/ghostunnel-ring/stores \
     -traces /var/lib/ghostunnel-ring/stores/gt \
     -proc /proc \
-    -window 4 \
+    -window 3 \
     -min-cycle 300ms \
     -cadence 10 \
     -heartbeat-max-age 30s \

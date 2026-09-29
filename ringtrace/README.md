@@ -314,12 +314,21 @@ The material observer's reading: a `reload` with `outcome` `failed` and
 `serving` `true` is a failed reload that kept serving, which is a violation.
 The reader does not enforce this; it records what happened.
 
-What ghostunnel writes. `outcome` is `failed` when the reload itself failed
-**or** when any material file could not be hashed afterwards (that entry
-then has `sha256` `null` and `error` names it); a failed reload is sticky:
-ghostunnel refuses to serve (503, accepts refused, connections in flight
-closed with reason `halt`) until a later reload succeeds with every hash,
-and does not tell the service manager it is ready again until then.
+What ghostunnel writes. Each hash is of the material in use: the bytes the
+certificate loader and the policy loader read and parsed or compiled on
+their last successful load, never a second read of the path, so after a
+failed reload the entries name the material the process still serves
+with. A TLS source that hands back no files (PKCS#11, a keychain, SPIFFE)
+has its configured files read when the line is written. `outcome` is
+`failed` when the reload itself failed, **or** when a certificate, CA
+bundle or policy file could not be hashed (its loader handed back nothing
+for the configured path, or, for a source that hands back no files, the
+read failed; that entry then has `sha256` `null` and `error` names it),
+**or** when the CA bundle could not be stored (§1.6); a failed reload is
+sticky: ghostunnel refuses to serve (503, accepts refused, connections in
+flight closed with reason `halt`) until a later reload succeeds with every
+hash and the bundle stored, and does not tell the service manager it is
+ready again until then.
 `serving` is whether serving is allowed once this reload is accounted for,
 so it is `false` on every failed reload and also `false` on a successful
 one while a gate refusal is in force.
@@ -544,8 +553,14 @@ modified:
    rename after its content was synced.
 
 Writes of one chain are serialised inside the process, so two connections
-presenting the same first-seen chain at once write it once. An empty chain
-(no certificate presented) is refused and never stored; a chain above
+presenting the same first-seen chain at once write it once, and the second
+returns only after the first's directory sync; writes of different chains
+wait for each other only while the store's directory is checked (and, the
+first time, created and the root synced). A directory sync that fails (of
+`chains/` after a rename, or of the root after creating `chains/`) fails
+that write, every writer of the same chain waiting on it, and every later
+write into the store for the life of the process. An empty chain (no
+certificate presented) is refused and never stored; a chain above
 `MaxChainBytes` (1 MiB; `crypto/tls` refuses a handshake message above
 64 KiB, so none approaches it) is refused too, and the reader treats a file
 above it as malformed, so a reader never hashes an unbounded file.
@@ -569,7 +584,9 @@ nothing, on the first of:
 1. `hash` is not 64 lower-case hexadecimal characters (so a name is never
    a path).
 2. `<root>/chains/<hash>.der` does not exist, or is not a regular file (a
-   symbolic link is judged as the link and refused; a directory is refused).
+   symbolic link is judged as the link and refused; a directory is refused),
+   or, opened as the gate opens a heartbeat (§3, without following a link
+   and without waiting), is not the regular file the `Lstat` found.
    A `<hash>.tmp` is never read, whatever it holds: a chain that only has
    its `.tmp` is absent.
 3. The file is larger than `MaxChainBytes` (checked by size before any
@@ -645,8 +662,9 @@ rules 1 to 4 (§1.5) on `<root>/material/<hash>` with the bound
 `MaxMaterialBytes`: a name that is not 64 lower-case hexadecimal
 characters; a file absent or not regular as `Lstat` sees it (a symbolic
 link, a directory; a `<hash>.tmp` is never read, so a bundle that only has
-its `.tmp` is absent); a file over the bound, checked by size before any
-content is read; content whose SHA-256 is not the name. Each returns an
+its `.tmp` is absent), or not that regular file once opened; a file over
+the bound, checked by size before any content is read; content whose
+SHA-256 is not the name. Each returns an
 error and nothing. There is no rule 5: the bytes are returned as stored.
 `Read` (§1.4) accepts `material/` beside the boots and does not walk it.
 What the members do with a bundle they have read (the pool a presented
@@ -783,25 +801,33 @@ zero refuses everything), `MaxHeartbeatBytes` (default 64 KiB), `Now`.
 It reads, in this order, and **refuses on the first of**:
 
 1. **Configuration**: `MaxHeartbeatAge` ≤ 0, `MaxHeartbeatBytes` ≤ 0, no
-   clock, no members, or a coordinator that is not a member.
-2. **The root**: cannot be stat'ed or is not a directory.
-3. **For each member in identity order**:
-   - the store directory is missing or not a directory;
+   clock, no members, no `Root`, or a coordinator that is not a member.
+2. **For each member in identity order**:
    - `<member>/halt` exists (a regular file is "in force"; anything else at
-     that name is also a refusal);
+     that name is also a refusal), or its `Lstat` fails for any reason but
+     absence;
    - `<member>/fault` exists, the same way;
    - `<member>/halts/` cannot be listed;
    - `<member>/halts/` holds any entry other than a regular file whose name
      ends in `.tmp`. A regular non-`.tmp` file is a delivered halt in force,
      **regardless of its content or size**; a subdirectory or other entry is a
      refusal in its own right.
-4. **The coordinator's heartbeat**:
+
+   The root and the stores are not read on their own: a root or a store
+   that is missing, not a directory or a link to nothing fails the `Lstat`s
+   (`ENOTDIR`) or leaves `halts/` unlistable, and is refused there.
+3. **The coordinator's heartbeat**:
    - `<coordinator>/heartbeat/` cannot be listed;
    - it holds any entry other than a regular `NNNNNNNNNN.hb` or
      `NNNNNNNNNN.hb.tmp`;
    - it holds no `.hb` file (a `.hb.tmp` alone is not a heartbeat);
    - the newest `.hb` (highest name, which is highest sequence) is larger than
      `MaxHeartbeatBytes`, checked before it is read;
+   - opened without following a link and without waiting (`O_NOFOLLOW` and
+     `O_NONBLOCK` on unix, the reparse point itself on Windows), the open
+     file is not a regular file within the bound, or not the file the
+     `Lstat` found: a pipe or anything else swapped in after the `Lstat` is
+     refused, never waited on;
    - it does not begin with `{"kind":"heartbeat",`;
    - it does not parse strictly under SPEC §3.2: exact keys, `version` 1,
      `observer` equal to the coordinator, `sequence` equal to the name,
@@ -866,7 +892,18 @@ was missed), and a watched directory removed, moved or unmounted fails the
 watcher. On Windows, one `ReadDirectoryChangesW` on the tree root with the
 subtree flag, for name, directory-name, attribute, size, last-write,
 creation and security changes; a completion with no bytes is the kernel's
-buffer overflowing, marked stale the same way. Elsewhere, no watcher.
+buffer overflowing, marked stale the same way. A notification marks the
+decision stale unless its path is one the gate never reads: under `gt\`,
+under a store's `copy*\`, or under the `heartbeat\` of a store that is not
+the coordinator's, matched without regard to case. An 8.3 short name or
+any other name the watcher does not recognise marks it stale. Since the
+kernel reports a change where it happened and the gate reads through
+links, that holds only while every store, its `halts\` and the
+coordinator's `heartbeat\` is a plain directory and not a reparse point,
+which the watcher checks at start, whenever a notification names one of
+them or a name it cannot match, and after an overflow or a cancelled
+read; once one is not, every notification marks the decision stale.
+Elsewhere, no watcher.
 **Without a watcher, or once it has failed**, only the window stands: every
 accept more than 10 ms after the last scan is a full scan, a scan per
 accept, and concurrent accepts share one.

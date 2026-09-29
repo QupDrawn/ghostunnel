@@ -192,6 +192,64 @@ func TestOwnStoreMismatches(t *testing.T) {
 	osWant(t, ownStoreMismatches(osEntries(), tree, "tunnel", osSelf, osLookup, unknown), "tunnel/halts")
 }
 
+// Each name the tree gives is resolved once in a comparison, a failure as a
+// failure, and a second comparison resolves every name again: the answers
+// are the lookup's, never a remembered one from an earlier cycle.
+func TestOwnStoreLookupsOncePerComparison(t *testing.T) {
+	tree := osTree(t)
+	calls := map[string]int{}
+	counting := func(name string) (uint32, error) {
+		calls[name]++
+		return osLookup(name)
+	}
+	osWant(t, ownStoreMismatches(osEntries(), tree, "tunnel", osSelf, counting, counting))
+	if len(calls) == 0 {
+		t.Fatal("no name was resolved")
+	}
+	for name, n := range calls {
+		// One uid lookup and one gid lookup at most: the two are separate
+		// namespaces and each is memoized on its own.
+		if n > 2 {
+			t.Fatalf("%s resolved %d times in one comparison", name, n)
+		}
+	}
+	uids := map[string]int{}
+	gids := map[string]int{}
+	countUID := func(name string) (uint32, error) { uids[name]++; return osLookup(name) }
+	countGID := func(name string) (uint32, error) { gids[name]++; return osLookup(name) }
+	osWant(t, ownStoreMismatches(osEntries(), tree, "tunnel", osSelf, countUID, countGID))
+	for name, n := range uids {
+		if n != 1 {
+			t.Fatalf("user %s resolved %d times, want once", name, n)
+		}
+	}
+	for name, n := range gids {
+		if n != 1 {
+			t.Fatalf("group %s resolved %d times, want once", name, n)
+		}
+	}
+	// A failing lookup is asked once and fails every row that names it.
+	failed := 0
+	failing := func(name string) (uint32, error) {
+		if name == "gtobs-material" {
+			failed++
+			return 0, errors.New("no such user")
+		}
+		return osLookup(name)
+	}
+	osWant(t, ownStoreMismatches(osEntries(), tree, "tunnel", osSelf, failing, osLookup), "tunnel/copy", "tunnel/copy/heartbeat")
+	if failed != 1 {
+		t.Fatalf("the failing name was asked %d times, want once", failed)
+	}
+	// The next comparison asks again, and a name that resolves now passes.
+	failed = 0
+	osWant(t, ownStoreMismatches(osEntries(), tree, "tunnel", osSelf, osLookup, osLookup))
+	osWant(t, ownStoreMismatches(osEntries(), tree, "tunnel", osSelf, failing, osLookup), "tunnel/copy", "tunnel/copy/heartbeat")
+	if failed != 1 {
+		t.Fatalf("a second comparison asked the failing name %d times, want once", failed)
+	}
+}
+
 func TestOwnStorePaths(t *testing.T) {
 	cfg := &Config{Identity: "tunnel", Members: sampleMembers, Coordinator: "super", CopyAuthor: fixtureCopyAuthor}
 	var rels []string

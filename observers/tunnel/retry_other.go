@@ -23,7 +23,7 @@ func readRetrying(read func() error) error {
 	return read()
 }
 
-// readFile returns the bytes of p.
+// readFile returns the bytes of the regular file p names (readRegularFile).
 func readFile(p string) ([]byte, error) {
-	return os.ReadFile(p)
+	return readRegularFile(p)
 }

@@ -75,7 +75,13 @@ func runGoBench(tree string, pkgs []string, count int) (string, error) {
 	cmd.Dir = tree
 	var out bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &out
-	err := cmd.Run()
+	ownGroup(cmd)
+	g := &goTest{cmd: cmd}
+	err := startChild(cmd, g)
+	if err == nil {
+		err = cmd.Wait()
+		releaseChild(g)
+	}
 	if err != nil {
 		err = fmt.Errorf("go %s: %v", strings.Join(args[:7], " "), err)
 	}

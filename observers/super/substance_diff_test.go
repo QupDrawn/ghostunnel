@@ -7,12 +7,18 @@ package main
 // must equal what the proxy's verifier decides and what ServerRule names;
 // on a matrix of chains and times the mirror's verification must equal
 // crypto/x509 with the options the proxy's chain verifier uses; and in pin
-// mode the mirror's pin check must equal the proxy's. The recorded form
+// mode the mirror's pin check must equal the proxy's; a policy file, as a
+// .rego module or as a bundle, compiled by the mirror from the bytes it
+// hashed must decide as the proxy's policy.Prepare does on those bytes,
+// whatever the file holds by the time it is compiled. The recorded form
 // of each rule set is built here as ring.go's aclRules builds it (sorted,
 // prefix:value, the policy by its file's hash). Every member carries a
 // byte-identical copy of this file.
 
 import (
+	"archive/tar"
+	"bytes"
+	"compress/gzip"
 	"crypto/sha256"
 	"crypto/sha512"
 	"crypto/x509"
@@ -23,6 +29,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"testing"
@@ -31,6 +38,7 @@ import (
 	"github.com/ghostunnel/ghostunnel/auth"
 	"github.com/ghostunnel/ghostunnel/policy"
 	"github.com/ghostunnel/ghostunnel/wildcard"
+	"github.com/open-policy-agent/opa/v1/rego"
 )
 
 // diffPolicy allows three shapes of leaf, so that the policy's decision
@@ -491,5 +499,162 @@ func TestSubstanceDifferentialPolicyLoad(t *testing.T) {
 	}
 	if !strings.HasPrefix(leaves[0].cert.Subject.CommonName, "client") {
 		t.Fatal("the first leaf is not the client")
+	}
+}
+
+// diffBundle is a bundle tarball, as opa build writes one: a gzipped tar
+// of the files given.
+func diffBundle(t testing.TB, files map[string]string) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gz)
+	names := make([]string, 0, len(files))
+	for name := range files {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		if err := tw.WriteHeader(&tar.Header{Name: name, Mode: 0o644, Size: int64(len(files[name])), Typeflag: tar.TypeReg}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tw.Write([]byte(files[name])); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+// diffPolicyForms are a policy file in each form the proxy loads, the
+// .rego module and the bundle, each with a second content that decides
+// otherwise on the leaf matrix.
+func diffPolicyForms(t testing.TB) []struct {
+	name        string
+	first, next []byte
+} {
+	t.Helper()
+	const bundlePolicy = "package policy\n\ndefault allow := false\n\nallow if input.certificate.Subject.CommonName == \"client.example\"\n\nallow if \"dev\" in input.certificate.Subject.OrganizationalUnit\n"
+	const bundleOther = "package policy\n\ndefault allow := false\n\nallow if input.certificate.Subject.CommonName == \"other.example\"\n"
+	const regoOther = "package policy\n\ndefault allow = false\n\nallow {\n\tinput.certificate.Subject.CommonName == \"other.example\"\n}\n"
+	return []struct {
+		name        string
+		first, next []byte
+	}{
+		{"policy.rego", []byte(diffPolicy), []byte(regoOther)},
+		{"bundle.tar.gz", diffBundle(t, map[string]string{"policy.rego": bundlePolicy}), diffBundle(t, map[string]string{"policy.rego": bundleOther})},
+	}
+}
+
+// diffProxyAllows is the proxy's decision on each leaf under the policy
+// the proxy prepares from data at path (policy.Prepare), through its own
+// verifier.
+func diffProxyAllows(t testing.TB, p *diffPKI, leaves []*subEntity, path string, data []byte) []bool {
+	t.Helper()
+	pq, err := policy.Prepare(path, diffQuery, data)
+	if err != nil {
+		t.Fatalf("the proxy's loader refused %s: %v", path, err)
+	}
+	acl := auth.ACL{AllowOPAQuery: policy.WrapForTest(&pq), OPAQueryTimeout: 10 * time.Second}
+	out := make([]bool, len(leaves))
+	for i, leaf := range leaves {
+		out[i] = acl.VerifyPeerCertificateServer(diffRaw(leaf, p.inter), [][]*x509.Certificate{{leaf.cert}}) == nil
+	}
+	return out
+}
+
+// diffMirrorAllows is the mirror's decision on each leaf under the query
+// it compiled.
+func diffMirrorAllows(t testing.TB, pq *rego.PreparedEvalQuery, leaves []*subEntity) []bool {
+	t.Helper()
+	out := make([]bool, len(leaves))
+	for i, leaf := range leaves {
+		allowed, _, err := substanceEvalPolicy(pq, leaf.cert)
+		if err != nil {
+			t.Fatalf("leaf %d: %v", i, err)
+		}
+		out[i] = allowed
+	}
+	return out
+}
+
+// TestSubstanceDifferentialPolicyForms: a .rego file and a bundle, each
+// compiled by the mirror from the bytes it hashed, decide on every leaf as
+// the proxy's policy.Prepare does on the same bytes.
+func TestSubstanceDifferentialPolicyForms(t *testing.T) {
+	p := diffMint(t)
+	leaves := p.diffLeaves(t)
+	for _, form := range diffPolicyForms(t) {
+		path := filepath.Join(t.TempDir(), form.name)
+		if err := os.WriteFile(path, form.first, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		hash := substanceHash(form.first)
+		pq, err := p.diffCycle().policy(&gtMaterial{Material: "policy", Path: path, SHA256: &hash}, hash)
+		if err != nil {
+			t.Fatalf("%s: the mirror did not compile it: %v", form.name, err)
+		}
+		got, want := diffMirrorAllows(t, pq, leaves), diffProxyAllows(t, p, leaves, path, form.first)
+		allows := 0
+		for i := range leaves {
+			if got[i] != want[i] {
+				t.Errorf("%s leaf %d (%s): mirror %v, proxy %v", form.name, i, diffDescribe(leaves[i]), got[i], want[i])
+			}
+			if want[i] {
+				allows++
+			}
+		}
+		if allows == 0 || allows == len(leaves) {
+			t.Fatalf("%s is one-sided: %d allows of %d", form.name, allows, len(leaves))
+		}
+		t.Logf("%s: %d leaves, %d allowed by both", form.name, len(leaves), allows)
+	}
+}
+
+// TestSubstancePolicyCompiledFromTheHashedBytes: the file rewritten
+// between the hash and the compile changes nothing of what is compiled,
+// in either form: the query decides as the proxy does on the bytes hashed,
+// and not as on the bytes that replaced them. The next cycle reads the
+// replacement, which no longer hashes to the recorded hash, and fails.
+func TestSubstancePolicyCompiledFromTheHashedBytes(t *testing.T) {
+	p := diffMint(t)
+	leaves := p.diffLeaves(t)
+	for _, form := range diffPolicyForms(t) {
+		path := filepath.Join(t.TempDir(), form.name)
+		if err := os.WriteFile(path, form.first, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		prev := substancePolicyHashed
+		rewrote := 0
+		substancePolicyHashed = func(p string) {
+			if p == path {
+				rewrote++
+				if err := os.WriteFile(path, form.next, 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+		hash := substanceHash(form.first)
+		m := &gtMaterial{Material: "policy", Path: path, SHA256: &hash}
+		pq, err := p.diffCycle().policy(m, hash)
+		substancePolicyHashed = prev
+		if err != nil || rewrote != 1 {
+			t.Fatalf("%s: compiled %v after %d rewrites", form.name, err, rewrote)
+		}
+		got := diffMirrorAllows(t, pq, leaves)
+		if want := diffProxyAllows(t, p, leaves, path, form.first); !reflect.DeepEqual(got, want) {
+			t.Fatalf("%s: the mirror decided otherwise than the proxy on the bytes hashed", form.name)
+		}
+		if replaced := diffProxyAllows(t, p, leaves, path, form.next); reflect.DeepEqual(got, replaced) {
+			t.Fatalf("%s: the two contents decide alike, so the rewrite proves nothing", form.name)
+		}
+		if _, err := p.diffCycle().policy(m, hash); err == nil {
+			t.Fatalf("%s: the rewritten file was compiled under the recorded hash", form.name)
+		}
 	}
 }

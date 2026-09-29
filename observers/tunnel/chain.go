@@ -135,7 +135,7 @@ func (r *reader) runC(disk, relDir, author string) *chainResult {
 		}
 		e.Read = true
 		e.Bytes = data
-		e.Hash = sha256Hex(data)
+		e.Hash = r.hashOf(e.Disk, data)
 		res.Hashes[e.Hash] = true
 		hb, err := r.parseEntry(data, e.Hash)
 		if err != nil || hb.Observer != author || hb.Sequence != e.Seq {

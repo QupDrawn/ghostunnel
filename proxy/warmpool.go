@@ -82,7 +82,8 @@ type warmConn struct {
 	// not close it too.
 	taken bool
 	// result carries the reader's outcome: nil for a timeout (the handout's
-	// probe found the socket open), else why the connection is dead.
+	// probe found the socket open, and its deadline is cleared), else why
+	// the connection cannot be handed out.
 	result chan error
 }
 
@@ -248,11 +249,27 @@ func (w *warmPool) read(wc *warmConn) {
 		}
 	}
 
+	// A timeout is the handout's probe (below): its deadline is cleared
+	// here, before the lock, so the handout gets the connection back as it
+	// was pooled. A connection that timed out and is not being handed out
+	// is closed below, deadline or not.
+	var cleared error
+	timedOut := isTimeoutError(err)
+	if timedOut {
+		cleared = wc.conn.SetReadDeadline(time.Time{})
+	}
+
 	w.mu.Lock()
-	if isTimeoutError(err) && wc.taken {
-		// The handout's probe: the socket was still open.
+	if timedOut && wc.taken {
+		// The handout's probe: the socket was still open. Handed out alive,
+		// the connection has proved usable, and the delay after failures
+		// is forgotten, unless its deadline could not be cleared, in which
+		// case the handout closes it and tries the next.
+		if cleared == nil {
+			w.backoff = 0
+		}
 		w.mu.Unlock()
-		wc.result <- nil
+		wc.result <- cleared
 		return
 	}
 	// Dead, or ended by a drain or expiry (already taken): the handout,
@@ -338,25 +355,14 @@ func (w *warmPool) take() net.Conn {
 			_ = wc.conn.Close()
 			continue
 		}
+		// The reader has cleared the deadline and, on nil, forgotten the
+		// delay after failures under the lock it already held.
 		if err := <-wc.result; err != nil {
 			_ = wc.conn.Close()
 			continue
 		}
-		if err := wc.conn.SetReadDeadline(time.Time{}); err != nil {
-			_ = wc.conn.Close()
-			continue
-		}
-		w.resetBackoff()
 		return wc.conn
 	}
-}
-
-// resetBackoff forgets the delay after failures: a pooled connection has
-// proved usable (handed out alive, or idle to expiry untouched).
-func (w *warmPool) resetBackoff() {
-	w.mu.Lock()
-	w.backoff = 0
-	w.mu.Unlock()
 }
 
 // expire closes every pooled connection idle for the limit or longer; the

@@ -17,6 +17,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -157,17 +158,55 @@ func procStatStartTicks(stat []byte) (int64, error) {
 	return ticks, nil
 }
 
-// procBootTime is the btime line of <root>/stat.
+// procStatMaxBytes bounds the read of <root>/stat up to its btime line, and
+// so any one line of it. The intr line carries a count for every interrupt
+// the kernel numbers, which on a large host is far past bufio.Scanner's
+// default 64 KiB token; the bound is well above any kernel's and exists so
+// that a table that is not a kernel's cannot hold the read.
+const procStatMaxBytes = 4 << 20
+
+// errProcStatBound is the read of <root>/stat reaching procStatMaxBytes.
+var errProcStatBound = fmt.Errorf("stat: exceeds %d bytes before its btime line", procStatMaxBytes)
+
+// procStatReader is a reader that fails, rather than ends, once it has
+// returned left bytes: a scan cut short by the bound is an error, never
+// an end of file that would hand over a truncated last line.
+type procStatReader struct {
+	r    io.Reader
+	left int64
+}
+
+func (p *procStatReader) Read(b []byte) (int, error) {
+	if p.left <= 0 {
+		return 0, errProcStatBound
+	}
+	if int64(len(b)) > p.left {
+		b = b[:p.left]
+	}
+	n, err := p.r.Read(b)
+	p.left -= int64(n)
+	return n, err
+}
+
+// procBootTime is the btime line of <root>/stat, read to at most
+// procStatMaxBytes. A line longer than that, or a file that reaches it
+// before its btime line, fails.
 func procBootTime(root string) (int64, error) {
 	f, err := os.Open(filepath.Join(root, "stat"))
 	if err != nil {
 		return 0, err
 	}
 	defer f.Close()
-	sc := bufio.NewScanner(f)
+	sc := bufio.NewScanner(&procStatReader{r: f, left: procStatMaxBytes})
+	sc.Buffer(make([]byte, 0, 64<<10), procStatMaxBytes)
 	for sc.Scan() {
 		fields := strings.Fields(sc.Text())
 		if len(fields) == 2 && fields[0] == "btime" {
+			// A read that failed hands the scan its buffered tail as a
+			// last line, which may be a btime line cut short.
+			if err := sc.Err(); err != nil {
+				return 0, err
+			}
 			n, err := strconv.ParseInt(fields[1], 10, 64)
 			if err != nil || n < 0 {
 				return 0, fmt.Errorf("stat: btime %q is not a time", fields[1])

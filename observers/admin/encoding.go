@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"regexp"
 	"sort"
@@ -108,51 +109,148 @@ func heartbeatName(seq int64) string {
 	return fmt.Sprintf("%010d.hb", seq)
 }
 
+// errNotJudged is an open that found another file than the one its Lstat
+// judged: the name was replaced between the two.
+var errNotJudged = errors.New("the file opened is not the one judged")
+
+// judgeAttempts bounds how often a read judges a name afresh after the file
+// it opened was not the one judged. A writer renames a file into place
+// (SPEC 5), so one replacement between the Lstat and the open is ordinary;
+// a name replaced on every attempt fails the read.
+const judgeAttempts = 3
+
+// openRegular opens p for reading and holds the handle to a regular file:
+// the open never waits (openReadFlags: a named pipe planted at p opens at
+// once rather than waiting for a writer, and is then refused), and the
+// handle's own stat must be a regular file and, when judged is not nil, the
+// very file judged, by os.SameFile. Anything else is closed and refused.
+// The handle is returned with its stat.
+func openRegular(p string, judged os.FileInfo) (*os.File, os.FileInfo, error) {
+	f, err := os.OpenFile(p, openReadFlags, 0)
+	if err != nil {
+		return nil, nil, err
+	}
+	opened, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, nil, err
+	}
+	if !opened.Mode().IsRegular() {
+		f.Close()
+		return nil, nil, fmt.Errorf("%s: the file opened is not a regular file", p)
+	}
+	if judged != nil && !os.SameFile(judged, opened) {
+		f.Close()
+		return nil, nil, fmt.Errorf("%s: %w", p, errNotJudged)
+	}
+	return f, opened, nil
+}
+
+// readAtMost reads r to its end or to max+1 bytes, whichever comes first,
+// into a buffer sized from size, the length a stat reported: a file that
+// has not changed since is read with no growth. A wrong size changes only
+// the allocation; the bound holds over what is actually read.
+func readAtMost(r io.Reader, size, max int64) ([]byte, error) {
+	n := size
+	if n < 0 {
+		n = 0
+	}
+	if n > max {
+		n = max
+	}
+	buf := make([]byte, 0, n+1)
+	for int64(len(buf)) <= max {
+		if len(buf) == cap(buf) {
+			buf = append(buf, 0)[:len(buf)]
+		}
+		room := buf[len(buf):cap(buf)]
+		if left := max + 1 - int64(len(buf)); int64(len(room)) > left {
+			room = room[:left]
+		}
+		m, err := r.Read(room)
+		buf = buf[:len(buf)+m]
+		if err == io.EOF {
+			return buf, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
+	return buf, nil
+}
+
 // readBounded stats a file, refuses one larger than max without reading it,
 // and otherwise returns its bytes (SPEC 3.1: sizes are checked before
 // content). oversized is true when the bound was exceeded; err reports a
-// file that could not be read at all. The open and the read go through
+// file that could not be read at all. The file read is the one the Lstat
+// judged (openRegular); a name replaced between the two is judged afresh,
+// up to judgeAttempts times. The open and the read go through
 // readRetrying: on Windows a handle held elsewhere for an instant is waited
 // out within a bounded budget, and a file still unreadable after it fails.
 func readBounded(path string, max int64) (data []byte, oversized bool, err error) {
-	info, err := os.Lstat(path)
-	if err != nil {
-		return nil, false, err
-	}
-	if !info.Mode().IsRegular() {
-		return nil, false, fmt.Errorf("%s is not a regular file", path)
-	}
-	if info.Size() > max {
-		return nil, true, nil
-	}
-	err = readRetrying(func() error {
-		f, err := os.Open(path)
+	for attempt := 1; ; attempt++ {
+		info, err := lstatForRead(path)
 		if err != nil {
-			return err
+			return nil, false, err
 		}
-		defer f.Close()
-		// The file may have grown between the stat and the read; the
-		// bound holds over what is actually read.
-		data, err = io.ReadAll(io.LimitReader(f, max+1))
-		return err
-	})
-	if err != nil {
-		return nil, false, err
+		if !info.Mode().IsRegular() {
+			return nil, false, fmt.Errorf("%s is not a regular file", path)
+		}
+		if info.Size() > max {
+			return nil, true, nil
+		}
+		err = readRetrying(func() error {
+			f, _, err := openRegular(path, info)
+			if err != nil {
+				return err
+			}
+			defer f.Close()
+			// The file may have grown between the stat and the read; the
+			// bound holds over what is actually read.
+			data, err = readAtMost(f, info.Size(), max)
+			return err
+		})
+		if errors.Is(err, errNotJudged) && attempt < judgeAttempts {
+			continue
+		}
+		if err != nil {
+			return nil, false, err
+		}
+		if int64(len(data)) > max {
+			return nil, true, nil
+		}
+		return data, false, nil
 	}
-	if int64(len(data)) > max {
-		return nil, true, nil
-	}
-	return data, false, nil
 }
+
+// judgeFile is the Lstat a read judges a file by, with the identity
+// os.SameFile compares taken at once. On Windows an Lstat result carries
+// no identity until SameFile first asks for it, and then takes it from
+// whatever the path names at that moment; asked here, it is the file the
+// Lstat saw, not whatever replaced it before the open. Elsewhere the
+// identity is in the Lstat result and the call costs nothing.
+func judgeFile(p string) (os.FileInfo, error) {
+	info, err := os.Lstat(p)
+	if err == nil {
+		os.SameFile(info, info)
+	}
+	return info, err
+}
+
+// lstatForRead is judgeFile. It is a variable only so that a test can
+// replace the file between the judgement and the open, which is the race
+// openRegular closes.
+var lstatForRead = judgeFile
 
 // readPrefix returns the first markerMax bytes of a file, for classification
 // of a file at a place where no kind is expected (SPEC 6.1 C1, 9 K2, 10.2 H2,
-// 11.2). A file that cannot be read classifies as nothing; the open goes
-// through readRetrying as readBounded's does.
+// 11.2). A file that cannot be read, or is not a regular file when opened
+// (openRegular), classifies as nothing; the open goes through readRetrying
+// as readBounded's does.
 func readPrefix(path string) []byte {
 	var prefix []byte
 	err := readRetrying(func() error {
-		f, err := os.Open(path)
+		f, _, err := openRegular(path, nil)
 		if err != nil {
 			return err
 		}
@@ -166,6 +264,19 @@ func readPrefix(path string) []byte {
 		return nil
 	}
 	return prefix
+}
+
+// readRegularFile returns the bytes of the file p names, following a
+// symbolic link as os.ReadFile does, from a handle held to a regular file
+// (openRegular) and read into a buffer sized from that handle's stat. It is
+// readFile's one read (retry_other.go, retry_windows.go).
+func readRegularFile(p string) ([]byte, error) {
+	f, info, err := openRegular(p, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return readAtMost(f, info.Size(), math.MaxInt64-1)
 }
 
 // ---- strict JSON ----

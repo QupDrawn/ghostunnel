@@ -1561,7 +1561,11 @@ func TestClientListenSocketOpenFails(t *testing.T) {
 	*clientListenAddress = "unix:/nonexistent/dir/sock.sock"
 	*clientForwardAddress = "127.0.0.1:8080"
 
-	err := clientListen(&Environment{})
+	// The source the ring takes its material from: the system trust
+	// store, no file.
+	noCert, err := certloader.NoCertificate("")
+	assert.Nil(t, err)
+	err = clientListen(&Environment{tlsConfigSource: certloader.TLSConfigSourceFromCertificate(noCert, logger)})
 	assert.NotNil(t, err, "expected error for invalid socket address")
 	if err != nil {
 		// Loose assertion to stay resilient to error wording across OSes.

@@ -116,13 +116,15 @@ func (g *Gate) Check() Decision {
 	if !isMember {
 		return refuse("gate: coordinator %q is not a member", g.Coordinator)
 	}
-	if info, err := os.Stat(g.Root); err != nil {
-		return refuse("gate: root: %v", err)
-	} else if !info.IsDir() {
-		return refuse("gate: root %s is not a directory", g.Root)
+	if g.Root == "" {
+		return refuse("gate: no root")
 	}
 
-	// Has anything halted? Presence, not content, in identity order.
+	// Has anything halted? Presence, not content, in identity order. The
+	// root and the stores are not read on their own: a root or a store
+	// that is missing, a dangling link or not a directory makes the reads
+	// below fail (ENOTDIR, or a not-exist that the halts/ listing then
+	// refuses), so it is refused there.
 	for _, m := range members {
 		if d := g.checkStore(m); !d.Serve {
 			return d
@@ -134,14 +136,10 @@ func (g *Gate) Check() Decision {
 }
 
 // checkStore refuses on a halt, a fault or a delivered halt in one store,
-// and on anything it cannot read on the way.
+// and on anything it cannot read on the way: a store that cannot be read
+// as a directory fails the listing of halts/, whatever the lstats found.
 func (g *Gate) checkStore(m string) Decision {
 	store := filepath.Join(g.Root, m)
-	if info, err := os.Stat(store); err != nil {
-		return refuse("gate: store %s: %v", m, err)
-	} else if !info.IsDir() {
-		return refuse("gate: store %s is not a directory", m)
-	}
 	for _, name := range []string{"halt", "fault"} {
 		info, err := os.Lstat(filepath.Join(store, name))
 		if err == nil {

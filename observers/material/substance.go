@@ -51,8 +51,13 @@ package main
 // consulted the clock or the environment, which is never remembered, and
 // never under the start line's policy hash alone, since a reload replaces
 // the policy the rules run against; a policy's compilation under
-// (policy hash, query). No key is a size or a modification time. The cache
-// is in-process and is emptied when the boot changes.
+// (policy hash, query). A verdict the policy gave is answered from memory
+// only once the policy file has read and hashed clean on the cycle. No key
+// is a size or a modification time. The cache is in-process and is
+// emptied when the boot changes. The verdict on each line is kept too,
+// with the files it rests on (substanceState): it answers for the line
+// only on a cycle on which every one of those files reads clean, and the
+// line is judged afresh on any other.
 
 import (
 	"bytes"
@@ -65,9 +70,9 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -77,6 +82,8 @@ import (
 	_ "crypto/sha512"
 
 	"github.com/open-policy-agent/opa/v1/ast"
+	"github.com/open-policy-agent/opa/v1/bundle"
+	"github.com/open-policy-agent/opa/v1/loader"
 	"github.com/open-policy-agent/opa/v1/rego"
 	"github.com/open-policy-agent/opa/v1/topdown"
 )
@@ -134,20 +141,26 @@ const substancePolicyTimeout = 10 * time.Second
 // proxy's --allow-query (the start line records the policy's hash but not
 // the query it is asked, so it is a value to be set, -policy-query, the
 // same on every member; empty means a policy rule cannot be re-judged),
-// and the cross-cycle memory (nil: nothing remembered).
+// the cross-cycle memory (nil: nothing remembered), and the judgement of
+// the tunnel surface as a whole kept across cycles (judgememory.go; nil:
+// every record of the boot judged every time).
 type substanceJudge struct {
 	MaterialBase string
 	PolicyQuery  string
 	Cache        *substanceCache
+	Kept         *tunnelJudgement
 }
 
 // substanceJudgeFor is the judge a cycle runs with: the configuration's
-// values and the memory kept in State, allocated on first use.
+// values and the memories kept in State, allocated on first use.
 func substanceJudgeFor(cfg *Config, st *State) substanceJudge {
 	if st.Substance == nil {
 		st.Substance = &substanceCache{}
 	}
-	return substanceJudge{MaterialBase: cfg.MaterialBase, PolicyQuery: cfg.PolicyQuery, Cache: st.Substance}
+	if st.TunnelJudgement == nil {
+		st.TunnelJudgement = &tunnelJudgement{}
+	}
+	return substanceJudge{MaterialBase: cfg.MaterialBase, PolicyQuery: cfg.PolicyQuery, Cache: st.Substance, Kept: st.TunnelJudgement}
 }
 
 // substanceCache is the cross-cycle memory. Every key is a content hash,
@@ -449,14 +462,18 @@ func substanceReadMaterial(p string) ([]byte, error) {
 // refused, a directory is refused; a <name>.tmp is never opened, so a
 // file that only has its .tmp is absent); its size is at most max,
 // checked before any content is read, and the read is bounded by it; and
-// the content's SHA-256 is the name. The file opened is held to be the one
-// Lstat judged. Nothing is returned with an error. The name's shape is
-// the caller's (chain, ca). Under the read retry of this build, since a
-// stored file is renamed into place as it may be opened.
+// the content's SHA-256 is the name. The Lstat is judgeFile's (encoding.go,
+// through lstatForRead), whose identity is taken at once, and the open is
+// openRegular's: it never waits on a named pipe put at the name, and the
+// handle is held to a regular file and to the very file judged, so a name
+// replaced between the two is refused. Nothing is returned with an error.
+// The name's shape is the caller's (chain, ca). Under the read retry of
+// this build, since a stored file is renamed into place as it may be
+// opened.
 func substanceReadStored(p, name string, max int64) ([]byte, error) {
 	var data []byte
 	err := readRetrying(func() error {
-		info, err := os.Lstat(p)
+		info, err := lstatForRead(p)
 		if err != nil {
 			return err
 		}
@@ -466,18 +483,11 @@ func substanceReadStored(p, name string, max int64) ([]byte, error) {
 		if info.Size() > max {
 			return fmt.Errorf("stored %s: %d bytes exceeds the bound", name, info.Size())
 		}
-		f, err := os.Open(p)
+		f, _, err := openRegular(p, info)
 		if err != nil {
 			return err
 		}
 		defer f.Close()
-		opened, err := f.Stat()
-		if err != nil {
-			return err
-		}
-		if !opened.Mode().IsRegular() || !os.SameFile(info, opened) {
-			return fmt.Errorf("stored %s: the file opened is not the one judged", name)
-		}
 		var buf bytes.Buffer
 		if _, err := buf.ReadFrom(io.LimitReader(f, max+1)); err != nil {
 			return err
@@ -520,6 +530,43 @@ type substanceCycle struct {
 	// as the differential test does).
 	ruleSuffix, ruleSet, rulePolicy string
 	ruleSuffixSet                   bool
+	// use, while a line is judged (substanceState.judge), notes what the
+	// verdict rests on: the chain, CA bundle and policy read for it, and
+	// whether it may be kept. nil when nothing is noted.
+	use *substanceUse
+}
+
+// newSubstanceCycle is one cycle's reads over the boot under the judge,
+// with the judge's memory reset to the boot (a new one when it has none).
+func newSubstanceCycle(boot *gtBoot, j substanceJudge) *substanceCycle {
+	if j.Cache == nil {
+		j.Cache = &substanceCache{}
+	}
+	j.Cache.reset(boot.Number)
+	return &substanceCycle{judge: j, root: boot.Root, cache: j.Cache, chains: map[string]*substanceChain{}, cas: map[string]*substanceCA{}, files: map[string]*substanceFile{}}
+}
+
+// substanceUse is what one line's verdict rests on beyond the records and
+// the start line: the files read for it, by content (deps), the entries
+// the CA bundle and the policy were read by, and unkept when the verdict
+// may change with no file changing or rests on a file that did not read
+// clean: a chain, bundle or policy refused this cycle, a policy whose
+// evaluation consulted the clock or the environment or erred, an acl line
+// whose connection has no handshake line yet.
+type substanceUse struct {
+	deps         substanceDeps
+	caM, policyM *gtMaterial
+	unkept       bool
+}
+
+// substanceDeps is the files a verdict rests on, by content: the chain's
+// hash, the CA bundle's recorded hash, and the policy entry's path and
+// recorded hash; "" for each not read. Two verdicts with the same deps
+// rest on the same bytes.
+type substanceDeps struct {
+	chain  string
+	ca     string
+	policy string
 }
 
 // ruleSuffixFor is the rules' memory key after the chain hash: NUL, the
@@ -596,11 +643,24 @@ func (cy *substanceCycle) file(p string) *substanceFile {
 	return f
 }
 
-// chain reads gt/chains/<hash>.der by the reader's rules (substanceReadChain,
-// after the name's shape) and parses it as a concatenation of at least one
-// DER certificate; certs is nil on any refusal. The parse is remembered
-// under the hash, which the bytes read this cycle were held to.
+// chain is readChain, noted as a file the line being judged rests on.
 func (cy *substanceCycle) chain(hash string) *substanceChain {
+	c := cy.readChain(hash)
+	if u := cy.use; u != nil {
+		u.deps.chain = hash
+		if c.certs == nil {
+			u.unkept = true
+		}
+	}
+	return c
+}
+
+// readChain reads gt/chains/<hash>.der by the reader's rules
+// (substanceReadStored, after the name's shape) and parses it as a
+// concatenation of at least one DER certificate; certs is nil on any
+// refusal. The parse is remembered under the hash, which the bytes read
+// this cycle were held to.
+func (cy *substanceCycle) readChain(hash string) *substanceChain {
 	if c, ok := cy.chains[hash]; ok {
 		return c
 	}
@@ -626,7 +686,20 @@ func (cy *substanceCycle) chain(hash string) *substanceChain {
 	return c
 }
 
-// ca reads the CA bundle a material entry names from the material store
+// ca is readCA, noted as a file the line being judged rests on.
+func (cy *substanceCycle) ca(m *gtMaterial) *substanceCA {
+	c := cy.readCA(m)
+	if u := cy.use; u != nil {
+		if c.pool == nil {
+			u.unkept = true
+		} else {
+			u.deps.ca, u.caM = c.hash, m
+		}
+	}
+	return c
+}
+
+// readCA reads the CA bundle a material entry names from the material store
 // under the trace root, by the recorded hash and never by the path: the
 // bytes the proxy hashed for the line, which are what it verified against,
 // whatever the file at the path holds now. A bundle with no path (the
@@ -636,7 +709,7 @@ func (cy *substanceCycle) chain(hash string) *substanceChain {
 // not passed. The read is remembered for the cycle under the hash: two
 // entries that record one hash read it once, and two that record
 // different hashes, at one path or two, never answer for each other.
-func (cy *substanceCycle) ca(m *gtMaterial) *substanceCA {
+func (cy *substanceCycle) readCA(m *gtMaterial) *substanceCA {
 	if m == nil || m.Path == "" || m.SHA256 == nil {
 		return &substanceCA{}
 	}
@@ -723,15 +796,35 @@ func (cy *substanceCycle) verified(c *substanceChain, ca *substanceCA, at time.T
 
 // ---- the policy ----
 
-// policy compiles the policy file a material entry names, held to the hash
-// the rule set records, with the query this member was given, exactly as
-// the proxy loads it (policy/loader.go): a .rego file is parsed as a Rego
-// v0 module with annotations processed, as rego.Load parses it, from the
-// bytes that were hashed; any other path is a bundle, loaded by
-// rego.LoadBundle from the path after the file was hashed. The compiled
+// policy is readPolicy, noted as a file the line being judged rests on.
+func (cy *substanceCycle) policy(m *gtMaterial, hash string) (*rego.PreparedEvalQuery, error) {
+	pq, err := cy.readPolicy(m, hash)
+	if u := cy.use; u != nil {
+		if err != nil {
+			u.unkept = true
+		} else {
+			u.deps.policy, u.policyM = m.Path+"\x00"+*m.SHA256, m
+		}
+	}
+	return pq, err
+}
+
+// substancePolicyHashed is called with the policy file's path once its
+// bytes are read and hashed, before they are compiled. It does nothing; it
+// is a variable only so that a test can rewrite the file between the two,
+// which must not change what is compiled.
+var substancePolicyHashed = func(string) {}
+
+// readPolicy compiles the policy file a material entry names, held to the
+// hash the rule set records, with the query this member was given, exactly
+// as the proxy loads it (policy/loader.go, Prepare): from the bytes that
+// were read and hashed, and never from a second read. A .rego file is
+// parsed as a Rego v0 module with annotations processed, as rego.Load
+// parses it; any other path is a bundle tarball, read from those bytes
+// with the options rego.LoadBundle reads a bundle file with. The compiled
 // query is remembered under (policy hash, query), and so is a compilation
 // that failed, which is a function of the bytes.
-func (cy *substanceCycle) policy(m *gtMaterial, hash string) (*rego.PreparedEvalQuery, error) {
+func (cy *substanceCycle) readPolicy(m *gtMaterial, hash string) (*rego.PreparedEvalQuery, error) {
 	query := cy.judge.PolicyQuery
 	if query == "" {
 		return nil, errors.New("no policy query configured (-policy-query)")
@@ -756,6 +849,7 @@ func (cy *substanceCycle) policy(m *gtMaterial, hash string) (*rego.PreparedEval
 	}
 	pol := &substancePolicy{}
 	cy.cache.policies[key] = pol
+	substancePolicyHashed(p)
 	ctx, cancel := context.WithTimeout(context.Background(), substancePolicyTimeout)
 	defer cancel()
 	var r *rego.Rego
@@ -767,7 +861,18 @@ func (cy *substanceCycle) policy(m *gtMaterial, hash string) (*rego.PreparedEval
 		}
 		r = rego.New(rego.Query(query), rego.ParsedModule(mod), rego.SetRegoVersion(ast.RegoV0))
 	} else {
-		r = rego.New(rego.Query(query), rego.LoadBundle(p))
+		b, err := loader.NewFileLoader().
+			WithReader(bytes.NewReader(f.data)).
+			WithProcessAnnotation(true).
+			WithBundleLazyLoadingMode(bundle.HasExtension()).
+			WithSkipBundleVerification(false).
+			WithRegoVersion(ast.RegoUndefined).
+			AsBundle(p)
+		if err != nil {
+			pol.err = fmt.Errorf("loading error: %s", err)
+			return nil, pol.err
+		}
+		r = rego.New(rego.Query(query), rego.ParsedBundle(p, b))
 	}
 	pq, err := r.PrepareForEval(ctx)
 	if err != nil {
@@ -864,9 +969,21 @@ func substancePolicyInForce(mat substanceMaterial) string {
 // before the reload never answers for a line after it. The key's parts
 // after the chain hash are built once per cycle per policy in force
 // (ruleSuffixFor) and the key once per chain per cycle (rulesKey).
+//
+// A remembered verdict that the policy gave (the rule "policy", or none
+// under a set that names one) is answered only once the policy file has
+// read and hashed clean this cycle and compiled (policy), as it must for
+// a verdict reached afresh: the memory spares the evaluation, never the
+// read, so a policy file gone or changed on disk fails the line whether
+// or not its verdict is remembered.
 func (cy *substanceCycle) leafRule(r *substanceRules, c *substanceChain, leaf *x509.Certificate, mat substanceMaterial) (string, error) {
 	key := c.rulesKey(cy.ruleSuffixFor(r, mat))
 	if rule, ok := cy.cache.rules[key]; ok {
+		if r.policy != "" && (rule == "" || rule == "policy") {
+			if _, err := cy.policy(mat["policy"], r.policy); err != nil {
+				return "", err
+			}
+		}
 		return rule, nil
 	}
 	rule := r.matchingRule(leaf)
@@ -878,6 +995,11 @@ func (cy *substanceCycle) leafRule(r *substanceRules, c *substanceChain, leaf *x
 		}
 		allowed, c, err := substanceEvalPolicy(pq, leaf)
 		if err != nil {
+			// An evaluation that erred or timed out is not a function of
+			// the bytes, and is never kept.
+			if u := cy.use; u != nil {
+				u.unkept = true
+			}
 			return "", err
 		}
 		cacheable = c
@@ -887,6 +1009,8 @@ func (cy *substanceCycle) leafRule(r *substanceRules, c *substanceChain, leaf *x
 	}
 	if cacheable {
 		cy.cache.rules[key] = rule
+	} else if u := cy.use; u != nil {
+		u.unkept = true
 	}
 	return rule, nil
 }
@@ -935,38 +1059,261 @@ func (cy *substanceCycle) decide(r *substanceRules, c *substanceChain, mat subst
 const substanceACMEProbeRule = "acme-tls/1"
 
 // substanceFindings judges a readable current boot with a start line by
-// the two substance rules. Each failing connection is one finding per
-// rule: the handshake-substance findings in the order of the handshake
-// lines, then the acl-substance findings in the order of the acl lines.
+// the two substance rules, every record of it. Each failing connection is
+// one finding per rule: the handshake-substance findings in the order of
+// the handshake lines, then the acl-substance findings in the order of the
+// acl lines.
+func substanceFindings(boot *gtBoot, j substanceJudge) []Finding {
+	cy := newSubstanceCycle(boot, j)
+	s := newSubstanceState(boot.Records[0].Start)
+	for i := range boot.Records {
+		s.add(boot.Records, i)
+	}
+	return s.findings(cy, boot.Records)
+}
+
+// substanceState is what the two substance rules hold of the records
+// judged so far, in one walk in sequence order: the material in force
+// after them, each connection's first handshake line with the material of
+// its time, every verified handshake line with the material of its time,
+// every acl line, and the verdict on each line where it may be kept.
 //
 // The lines of a connection are paired by conn, not by their order: the
 // proxy writes a connection's handshake before its acl, but the rule is
 // about the handshake line of the same conn wherever it lies, and
 // conn-consistent (surface_tunnel.go) is what judges the count of each.
 // A connection's first handshake line is the one paired.
-func substanceFindings(boot *gtBoot, j substanceJudge) []Finding {
-	if j.Cache == nil {
-		j.Cache = &substanceCache{}
-	}
-	j.Cache.reset(boot.Number)
-	cy := &substanceCycle{judge: j, root: boot.Root, cache: j.Cache, chains: map[string]*substanceChain{}, cas: map[string]*substanceCA{}, files: map[string]*substanceFile{}}
-	start := boot.Records[0].Start
-	rules := substanceParseRules(start.Config.ACL)
-	server := start.Config.Mode == "server"
+//
+// A verdict is kept when every file it rests on (the chain, the CA bundle,
+// the policy: substanceUse) read clean when it was reached, and nothing
+// else in it can change: it is then a function of the records, the start
+// line, the judge's query and base, and those files' bytes, which their
+// hashes name. Kept verdicts are grouped by the files they rest on, and
+// each cycle every group's files are read and hashed again (clean): a
+// group whose files all read clean answers from its verdicts, and one
+// with a file that does not has every line of it judged afresh on this
+// cycle's reads. A line whose verdict is not kept is judged afresh every
+// cycle, and kept once it can be. The whole boot is judged by adding every
+// record to a new state (substanceFindings); the kept judgement
+// (judgememory.go) adds each cycle only the records it has not judged.
+type substanceState struct {
+	rules  *substanceRules
+	server bool
+	// mat is the material in force after the records judged, replaced,
+	// never changed, on a reload, so that a line holds the map of its
+	// time without a copy per line.
+	mat        substanceMaterial
+	firsts     map[int64]substanceLine
+	handshakes []substanceLine
+	acls       []substanceLine
+	groups     map[substanceDeps]*substanceGroup
+	loose      []substanceRef
+}
 
-	// One walk in sequence order: the material in force at each line,
-	// each connection's first handshake line with the material of its
-	// time, and every acl line. The material map is replaced, never
-	// changed, on a reload, so a handshake holds the map of its time
-	// without a copy per line.
-	mat := substanceMaterial{}
-	mat.apply(start.Config.Material)
-	type judged struct {
-		record   *gtRecord
-		material substanceMaterial
+// substanceLine is one line judged: its index in the boot's records and,
+// for a handshake line, the material in force at it.
+type substanceLine struct {
+	rec      int
+	material substanceMaterial
+}
+
+// substanceRef names a line of the state: the n-th verified handshake
+// line, or the n-th acl line.
+type substanceRef struct {
+	acl bool
+	n   int
+}
+
+// substanceGroup is the kept verdicts that rest on one set of files: the
+// entries the CA bundle and the policy are read by, every line kept here
+// and those of them that fail, each in the order they were kept.
+type substanceGroup struct {
+	caM, policyM *gtMaterial
+	lines        []substanceRef
+	failing      []substanceRef
+}
+
+// newSubstanceState is the state of no record judged under the start line.
+func newSubstanceState(start *gtStart) *substanceState {
+	s := &substanceState{
+		rules:  substanceParseRules(start.Config.ACL),
+		server: start.Config.Mode == "server",
+		mat:    substanceMaterial{},
+		firsts: map[int64]substanceLine{},
+		groups: map[substanceDeps]*substanceGroup{},
 	}
-	handshakes := map[int64]judged{}
-	var acls []*gtRecord
+	s.mat.apply(start.Config.Material)
+	return s
+}
+
+// add takes record i of recs into the state. A new line is judged by the
+// next findings.
+func (s *substanceState) add(recs []gtRecord, i int) {
+	rec := &recs[i]
+	switch rec.Kind {
+	case "reload":
+		if rec.Reload.Outcome == "ok" && len(rec.Reload.Material) > 0 {
+			next := substanceMaterial{}
+			for k, v := range s.mat {
+				next[k] = v
+			}
+			next.apply(rec.Reload.Material)
+			s.mat = next
+		}
+	case "handshake":
+		hs := rec.Handshake
+		if _, ok := s.firsts[hs.Conn]; !ok {
+			s.firsts[hs.Conn] = substanceLine{rec: i, material: s.mat}
+		}
+		if hs.Verified {
+			s.loose = append(s.loose, substanceRef{n: len(s.handshakes)})
+			s.handshakes = append(s.handshakes, substanceLine{rec: i, material: s.mat})
+		}
+	case "acl":
+		s.loose = append(s.loose, substanceRef{acl: true, n: len(s.acls)})
+		s.acls = append(s.acls, substanceLine{rec: i})
+	}
+}
+
+// handshakeFails is handshake-substance on one verified handshake line:
+// the proxy says it verified; so must this member, from the chain and the
+// CA bundle the proxy stored for the material in force (or the pins).
+// Client mode is not mirrored (the server's chain is verified against a
+// server name the trace does not carry), nor is a rule set with an entry
+// this file cannot read: a check that cannot run has not passed.
+func (s *substanceState) handshakeFails(cy *substanceCycle, recs []gtRecord, l substanceLine) bool {
+	rec := &recs[l.rec]
+	hs := rec.Handshake
+	if !s.server || hs.Chain == "" || len(s.rules.unknown) > 0 {
+		return true
+	}
+	c := cy.chain(hs.Chain)
+	if c.certs == nil {
+		return true
+	}
+	if len(s.rules.pins) > 0 {
+		return !s.rules.pinned(c.certs[0])
+	}
+	return !cy.verified(c, cy.ca(l.material["ca"]), rec.At)
+}
+
+// aclFails is acl-substance on one acl line: the rule set re-run on the
+// connection's chain must give the recorded decision, and on allow the
+// recorded rule. A deny this member would allow is a finding as much as an
+// allow it would deny.
+func (s *substanceState) aclFails(cy *substanceCycle, recs []gtRecord, l substanceLine) bool {
+	a := recs[l.rec].ACL
+	first, ok := s.firsts[a.Conn]
+	if !ok {
+		// No handshake line yet: a later one pairs with this line.
+		if u := cy.use; u != nil {
+			u.unkept = true
+		}
+		return true
+	}
+	if !s.server {
+		return true
+	}
+	hsRec := &recs[first.rec]
+	h := hsRec.Handshake
+	if a.Decision == "deny" && a.Rule == substanceACMEProbeRule && !h.Verified && h.Chain == "" {
+		// The challenge probe's denial (ring.go, Handshake): denied
+		// before any rule runs, no certificate asked for. The ALPN is not
+		// in the trace, so what is held is what the trace does carry:
+		// nothing verified, nothing presented, denied.
+		return false
+	}
+	var c *substanceChain
+	if h.Chain != "" {
+		c = cy.chain(h.Chain)
+		if c.certs == nil {
+			return true
+		}
+	}
+	decision, rule, err := cy.decide(s.rules, c, first.material, hsRec.At)
+	return err != nil || decision != a.Decision || (decision == "allow" && rule != a.Rule)
+}
+
+// judge is the verdict on one line on this cycle's reads, and what it
+// rests on when u is not nil.
+func (s *substanceState) judge(cy *substanceCycle, recs []gtRecord, ref substanceRef, u *substanceUse) bool {
+	cy.use = u
+	defer func() { cy.use = nil }()
+	if ref.acl {
+		return s.aclFails(cy, recs, s.acls[ref.n])
+	}
+	return s.handshakeFails(cy, recs, s.handshakes[ref.n])
+}
+
+// clean reports whether every file a group rests on reads clean this
+// cycle: the chain read, hashed to its name and parsed; the CA bundle read
+// from the material store, hashed to the recorded hash and holding a
+// certificate; the policy file read, hashed to the recorded hash and
+// compiled.
+func (s *substanceState) clean(cy *substanceCycle, deps substanceDeps, g *substanceGroup) bool {
+	if deps.chain != "" && cy.readChain(deps.chain).certs == nil {
+		return false
+	}
+	if deps.ca != "" && cy.readCA(g.caM).pool == nil {
+		return false
+	}
+	if deps.policy != "" {
+		if _, err := cy.readPolicy(g.policyM, s.rules.policy); err != nil {
+			return false
+		}
+	}
+	return true
+}
+
+// findings is the two rules' findings over the records the state has
+// judged, which are recs, every one, on this cycle's reads (cy).
+func (s *substanceState) findings(cy *substanceCycle, recs []gtRecord) []Finding {
+	var failHS, failACL []int
+	failed := func(ref substanceRef) {
+		if ref.acl {
+			failACL = append(failACL, ref.n)
+		} else {
+			failHS = append(failHS, ref.n)
+		}
+	}
+	for deps, g := range s.groups {
+		if s.clean(cy, deps, g) {
+			for _, ref := range g.failing {
+				failed(ref)
+			}
+			continue
+		}
+		for _, ref := range g.lines {
+			if s.judge(cy, recs, ref, nil) {
+				failed(ref)
+			}
+		}
+	}
+	loose := s.loose[:0]
+	for _, ref := range s.loose {
+		var u substanceUse
+		fails := s.judge(cy, recs, ref, &u)
+		if fails {
+			failed(ref)
+		}
+		if u.unkept {
+			loose = append(loose, ref)
+			continue
+		}
+		g := s.groups[u.deps]
+		if g == nil {
+			g = &substanceGroup{caM: u.caM, policyM: u.policyM}
+			s.groups[u.deps] = g
+		}
+		g.lines = append(g.lines, ref)
+		if fails {
+			g.failing = append(g.failing, ref)
+		}
+	}
+	s.loose = loose
+
+	sort.Ints(failHS)
+	sort.Ints(failACL)
 	var out []Finding
 	seen := map[Finding]bool{}
 	fail := func(check string, conn int64) {
@@ -976,87 +1323,11 @@ func substanceFindings(boot *gtBoot, j substanceJudge) []Finding {
 			out = append(out, f)
 		}
 	}
-	for i := range boot.Records {
-		rec := &boot.Records[i]
-		switch rec.Kind {
-		case "reload":
-			if rec.Reload.Outcome == "ok" && len(rec.Reload.Material) > 0 {
-				next := substanceMaterial{}
-				for k, v := range mat {
-					next[k] = v
-				}
-				next.apply(rec.Reload.Material)
-				mat = next
-			}
-		case "handshake":
-			hs := rec.Handshake
-			if _, ok := handshakes[hs.Conn]; !ok {
-				handshakes[hs.Conn] = judged{record: rec, material: mat}
-			}
-			if !hs.Verified {
-				continue
-			}
-			// handshake-substance: the proxy says it verified; so must
-			// this member, from the chain and the CA bundle the proxy
-			// stored for the material in force (or the pins). Client
-			// mode is not mirrored (the server's chain is
-			// verified against a server name the trace does not carry),
-			// nor is a rule set with an entry this file cannot read: a
-			// check that cannot run has not passed.
-			if !server || hs.Chain == "" || len(rules.unknown) > 0 {
-				fail(checkHandshakeSubstance, hs.Conn)
-				continue
-			}
-			c := cy.chain(hs.Chain)
-			if c.certs == nil {
-				fail(checkHandshakeSubstance, hs.Conn)
-				continue
-			}
-			if len(rules.pins) > 0 {
-				if !rules.pinned(c.certs[0]) {
-					fail(checkHandshakeSubstance, hs.Conn)
-				}
-				continue
-			}
-			if !cy.verified(c, cy.ca(mat["ca"]), rec.At) {
-				fail(checkHandshakeSubstance, hs.Conn)
-			}
-		case "acl":
-			acls = append(acls, rec)
-		}
+	for _, n := range failHS {
+		fail(checkHandshakeSubstance, recs[s.handshakes[n].rec].Handshake.Conn)
 	}
-
-	// acl-substance: the rule set re-run on the connection's chain must
-	// give the recorded decision, and on allow the recorded rule. A deny
-	// this member would allow is a finding as much as an allow it would
-	// deny.
-	for _, rec := range acls {
-		a := rec.ACL
-		hs, ok := handshakes[a.Conn]
-		if !ok || !server {
-			fail(checkACLSubstance, a.Conn)
-			continue
-		}
-		h := hs.record.Handshake
-		if a.Decision == "deny" && a.Rule == substanceACMEProbeRule && !h.Verified && h.Chain == "" {
-			// The challenge probe's denial (ring.go, Handshake): denied
-			// before any rule runs, no certificate asked for. The ALPN
-			// is not in the trace, so what is held is what the trace
-			// does carry: nothing verified, nothing presented, denied.
-			continue
-		}
-		var c *substanceChain
-		if h.Chain != "" {
-			c = cy.chain(h.Chain)
-			if c.certs == nil {
-				fail(checkACLSubstance, a.Conn)
-				continue
-			}
-		}
-		decision, rule, err := cy.decide(rules, c, hs.material, hs.record.At)
-		if err != nil || decision != a.Decision || (decision == "allow" && rule != a.Rule) {
-			fail(checkACLSubstance, a.Conn)
-		}
+	for _, n := range failACL {
+		fail(checkACLSubstance, recs[s.acls[n].rec].ACL.Conn)
 	}
 	return out
 }

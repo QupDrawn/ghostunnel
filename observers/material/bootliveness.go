@@ -80,9 +80,11 @@ func procLiveness(root string) livenessProbe {
 
 // bootStartPID reads the pid the start line of boot name records: the
 // first line of its first segment, decoded under every rule of a line. Any
-// failure is an error; the caller counts the boot as live.
-func bootStartPID(root, name string) (int64, error) {
-	f, err := os.Open(filepath.Join(root, name, gtBootName(1)+".trace"))
+// failure is an error; the caller counts the boot as live. The line is read
+// every time; its decode is remembered in mem under the SHA-256 of the
+// line's bytes (contentmemo.go), nil remembering nothing.
+func bootStartPID(root, name string, mem *contentMemo[startLineDecode]) (int64, error) {
+	f, _, err := openRegular(filepath.Join(root, name, gtBootName(1)+".trace"), nil)
 	if err != nil {
 		return 0, err
 	}
@@ -102,14 +104,25 @@ func bootStartPID(root, name string) (int64, error) {
 	if bytes.IndexByte(line, 0) >= 0 {
 		return 0, errors.New("the first line is not complete")
 	}
-	rec, err := gtDecodeLine(line[:len(line)-1])
-	if err != nil {
-		return 0, err
+	d := mem.get(sha256Hex(line), func() startLineDecode {
+		rec, err := gtDecode(line[:len(line)-1])
+		if err != nil {
+			return startLineDecode{err: err}
+		}
+		if rec.Kind != "start" || rec.Start == nil {
+			return startLineDecode{err: errors.New("the first line is not a start line")}
+		}
+		return startLineDecode{pid: rec.Start.PID}
+	})
+	return d.pid, d.err
+}
+
+// startLineMemo is the start-line memory of st, allocated on first use.
+func startLineMemo(st *State) *contentMemo[startLineDecode] {
+	if st.StartLines == nil {
+		st.StartLines = &contentMemo[startLineDecode]{}
 	}
-	if rec.Kind != "start" || rec.Start == nil {
-		return 0, errors.New("the first line is not a start line")
-	}
-	return rec.Start.PID, nil
+	return st.StartLines
 }
 
 // bootAmbiguousFindings takes the boot directories from the root's listing
@@ -122,11 +135,15 @@ func bootStartPID(root, name string) (int64, error) {
 // which is the check unable to run and so failing. The subject is that
 // boot followed by ":not-live". Then, among every boot, more than one
 // live pid is ambiguous about which proxy is the proxy, with those boots
-// as subject. The probe is consulted whenever there is a boot at all.
-func bootAmbiguousFindings(root string, listing *gtRoot, live livenessProbe) []Finding {
+// as subject. The probe is consulted whenever there is a boot at all. The
+// start lines are decoded through mem (bootStartPID), which keeps the
+// decodes of this call's lines and no others.
+func bootAmbiguousFindings(root string, listing *gtRoot, live livenessProbe, mem *contentMemo[startLineDecode]) []Finding {
 	if listing.Err != nil {
 		return nil // trace-readable reports the root
 	}
+	mem.begin()
+	defer mem.end()
 	var boots []string
 	for _, de := range listing.Entries {
 		if de.IsDir() && gtReBootName.MatchString(de.Name()) {
@@ -141,7 +158,7 @@ func bootAmbiguousFindings(root string, listing *gtRoot, live livenessProbe) []F
 	var ambiguous []string
 	var findings []Finding
 	for _, name := range boots {
-		pid, err := bootStartPID(root, name)
+		pid, err := bootStartPID(root, name, mem)
 		if err != nil {
 			ambiguous = append(ambiguous, name) // cannot be shown dead
 			continue
