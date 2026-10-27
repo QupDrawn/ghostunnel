@@ -28,6 +28,7 @@ import (
 	"github.com/ghostunnel/ghostunnel/auth"
 	"github.com/ghostunnel/ghostunnel/certloader"
 	"github.com/ghostunnel/ghostunnel/policy"
+	"github.com/ghostunnel/ghostunnel/policy/policytest"
 	"github.com/ghostunnel/ghostunnel/proxy"
 	"github.com/ghostunnel/ghostunnel/ringtrace"
 	"github.com/open-policy-agent/opa/v1/ast"
@@ -316,7 +317,7 @@ func TestRingPolicyOnlyFromThePolicyLoaded(t *testing.T) {
 	}
 	fromOther, err := loadOPAPolicy(other, "data.policy.allow")
 	require.NoError(t, err)
-	noFile := policy.WrapForTest(memberCompile(t, path, "data.policy.allow", []byte(ringPolicyV0)))
+	noFile := policytest.Wrap(memberCompile(t, path, "data.policy.allow", []byte(ringPolicyV0)))
 
 	for name, pol := range map[string]policy.Policy{"none": nil, "another path": fromOther, "no file": noFile} {
 		sources := ringSources{tls: caSource(t, pki.caPath), policy: pol, policyPath: path}

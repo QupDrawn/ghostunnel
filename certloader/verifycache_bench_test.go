@@ -22,7 +22,7 @@ import (
 	"time"
 
 	"github.com/ghostunnel/ghostunnel/auth"
-	"github.com/ghostunnel/ghostunnel/policy"
+	"github.com/ghostunnel/ghostunnel/policy/policytest"
 )
 
 // BenchmarkHandshake is one sequential mutually-authenticated handshake
@@ -53,7 +53,7 @@ func BenchmarkHandshake(b *testing.B) {
 			acl  auth.ACL
 		}{
 			{"rules", auth.ACL{AllowedCNs: []string{"someone", "else", "gopher"}}},
-			{"policy", auth.ACL{AllowOPAQuery: policy.WrapForTest(prepareQuery(b, allowGopherPolicy)), OPAQueryTimeout: 10 * time.Second}},
+			{"policy", auth.ACL{AllowOPAQuery: policytest.Wrap(prepareQuery(b, allowGopherPolicy)), OPAQueryTimeout: 10 * time.Second}},
 		} {
 			for _, cached := range []struct {
 				name string

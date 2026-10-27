@@ -37,6 +37,7 @@ import (
 
 	"github.com/ghostunnel/ghostunnel/auth"
 	"github.com/ghostunnel/ghostunnel/policy"
+	"github.com/ghostunnel/ghostunnel/policy/policytest"
 	"github.com/ghostunnel/ghostunnel/wildcard"
 	"github.com/open-policy-agent/opa/v1/rego"
 )
@@ -560,7 +561,7 @@ func diffProxyAllows(t testing.TB, p *diffPKI, leaves []*subEntity, path string,
 	if err != nil {
 		t.Fatalf("the proxy's loader refused %s: %v", path, err)
 	}
-	acl := auth.ACL{AllowOPAQuery: policy.WrapForTest(&pq), OPAQueryTimeout: 10 * time.Second}
+	acl := auth.ACL{AllowOPAQuery: policytest.Wrap(&pq), OPAQueryTimeout: 10 * time.Second}
 	out := make([]bool, len(leaves))
 	for i, leaf := range leaves {
 		out[i] = acl.VerifyPeerCertificateServer(diffRaw(leaf, p.inter), [][]*x509.Certificate{{leaf.cert}}) == nil

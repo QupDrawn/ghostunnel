@@ -16,7 +16,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ghostunnel/ghostunnel/policy"
+	"github.com/ghostunnel/ghostunnel/policy/policytest"
 	"github.com/ghostunnel/ghostunnel/wildcard"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -44,7 +44,7 @@ func TestServerRuleIsTheVerifiersRule(t *testing.T) {
 	sans := newLeafSANs(t, root, now, []string{"gopher.example"}, []net.IP{net.IPv4(10, 0, 0, 7)}, []*url.URL{uri}, []string{"eng"})
 	matcher, err := wildcard.CompileWithSeparator("spiffe://example/*", '/')
 	require.NoError(t, err)
-	opa := policy.WrapForTest(prepareQuery(t, allowGopherPolicy))
+	opa := policytest.Wrap(prepareQuery(t, allowGopherPolicy))
 
 	acls := []struct {
 		name string

@@ -33,6 +33,7 @@ public/
 .hugo_build.lock
 *.cdx.json
 *.spdx.json
+tools/bin/
 
 # Binaries a plain go build leaves beside each main package of the fork.
 *.exe

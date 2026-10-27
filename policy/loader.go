@@ -59,7 +59,7 @@ type FilePolicy interface {
 }
 
 // LoadedFileOf is p's LoadedFile, or false for a policy that is not a
-// FilePolicy (WrapForTest) or is nil.
+// FilePolicy (a test adapter) or is nil.
 func LoadedFileOf(p Policy) (path string, data []byte, ok bool) {
 	if f, isFile := p.(FilePolicy); isFile {
 		path, data = f.LoadedFile()

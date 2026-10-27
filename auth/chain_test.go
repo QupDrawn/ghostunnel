@@ -29,7 +29,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ghostunnel/ghostunnel/policy"
+	"github.com/ghostunnel/ghostunnel/policy/policytest"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -435,7 +435,7 @@ allow if {
 }
 `
 	cache := NewVerifyCache(16)
-	acl := ACL{AllowOPAQuery: policy.WrapForTest(prepareQuery(t, module)), OPAQueryTimeout: 10 * time.Second}.WithVerifyCache(cache)
+	acl := ACL{AllowOPAQuery: policytest.Wrap(prepareQuery(t, module)), OPAQueryTimeout: 10 * time.Second}.WithVerifyCache(cache)
 	verify := acl.VerifyPeerCertificateServerFor(valid.roots, func() time.Time { return now })
 	require.NoError(t, verify(valid.rawCerts, nil))
 	require.NoError(t, verify(valid.rawCerts, nil))
@@ -453,7 +453,7 @@ allow if {
 
 	// A policy that is a function of the certificate is remembered whole.
 	cache2 := NewVerifyCache(16)
-	acl2 := ACL{AllowOPAQuery: policy.WrapForTest(prepareQuery(t, allowGopherPolicy)), OPAQueryTimeout: 10 * time.Second}.WithVerifyCache(cache2)
+	acl2 := ACL{AllowOPAQuery: policytest.Wrap(prepareQuery(t, allowGopherPolicy)), OPAQueryTimeout: 10 * time.Second}.WithVerifyCache(cache2)
 	verify2 := acl2.VerifyPeerCertificateServerFor(valid.roots, func() time.Time { return now })
 	require.NoError(t, verify2(valid.rawCerts, nil))
 	require.NoError(t, verify2(valid.rawCerts, nil))

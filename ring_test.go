@@ -47,7 +47,7 @@ import (
 	"time"
 
 	"github.com/ghostunnel/ghostunnel/auth"
-	"github.com/ghostunnel/ghostunnel/policy"
+	"github.com/ghostunnel/ghostunnel/policy/policytest"
 	"github.com/ghostunnel/ghostunnel/proxy"
 	"github.com/ghostunnel/ghostunnel/ringtrace"
 	"github.com/ghostunnel/ghostunnel/wildcard"
@@ -1413,7 +1413,7 @@ func TestACLRules(t *testing.T) {
 	require.NoError(t, err)
 	uris, err := wildcard.CompileList([]string{"spiffe://example/*"})
 	require.NoError(t, err)
-	opa := policy.WrapForTest(nil)
+	opa := policytest.Wrap(nil)
 
 	cases := []struct {
 		name     string

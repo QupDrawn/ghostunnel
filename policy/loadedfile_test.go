@@ -135,7 +135,7 @@ func TestPolicyLoadedFileIsTheBytesCompiled(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, rs.Allowed(), "and the query compiled from them")
 
-	_, _, ok = LoadedFileOf(WrapForTest(&rego.PreparedEvalQuery{}))
+	_, _, ok = LoadedFileOf(queryPolicy{&rego.PreparedEvalQuery{}})
 	assert.False(t, ok, "a wrapped query has no file")
 	_, _, ok = LoadedFileOf(nil)
 	assert.False(t, ok)
@@ -347,4 +347,13 @@ func TestPolicyRefusesWhatIsNotOneFile(t *testing.T) {
 	assert.ErrorContains(t, err, "UNC path")
 	_, err = LoadFromPath("file://"+filepath.ToSlash(filepath.Join(dir, "policy.rego")), "data.policy.allow")
 	assert.ErrorContains(t, err, "URL")
+}
+
+// queryPolicy adapts a prepared query to Policy, with no file behind it.
+type queryPolicy struct{ q *rego.PreparedEvalQuery }
+
+func (p queryPolicy) Reload() error { return nil }
+
+func (p queryPolicy) Eval(ctx context.Context, options ...rego.EvalOption) (rego.ResultSet, error) {
+	return p.q.Eval(ctx, options...)
 }

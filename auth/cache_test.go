@@ -31,7 +31,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ghostunnel/ghostunnel/policy"
+	"github.com/ghostunnel/ghostunnel/policy/policytest"
 	"github.com/open-policy-agent/opa/v1/rego"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -435,7 +435,7 @@ allow if {
 		t.Run(tc.name, func(t *testing.T) {
 			chain := validChain(t, "gopher")
 			cache := NewVerifyCache(16)
-			uncached := ACL{AllowOPAQuery: policy.WrapForTest(prepareQuery(t, tc.module)), OPAQueryTimeout: 10 * time.Second}
+			uncached := ACL{AllowOPAQuery: policytest.Wrap(prepareQuery(t, tc.module)), OPAQueryTimeout: 10 * time.Second}
 			acl := uncached.WithVerifyCache(cache)
 			// The decision is whatever the policy makes of the certificate
 			// (the x509 builtin errors on its argument, which leaves the rule
@@ -460,7 +460,7 @@ allow if {
 // the certificate alone is cached, allow and deny alike.
 func TestVerifyCachePolicyDecisionIsRemembered(t *testing.T) {
 	cache := NewVerifyCache(16)
-	acl := ACL{AllowOPAQuery: policy.WrapForTest(prepareQuery(t, allowGopherPolicy)), OPAQueryTimeout: 10 * time.Second}.WithVerifyCache(cache)
+	acl := ACL{AllowOPAQuery: policytest.Wrap(prepareQuery(t, allowGopherPolicy)), OPAQueryTimeout: 10 * time.Second}.WithVerifyCache(cache)
 	gopher := validChain(t, "gopher")
 	other := validChain(t, "other")
 	require.NoError(t, acl.VerifyPeerCertificateServer(gopher.raw, gopher.chains))
@@ -487,7 +487,7 @@ allow if {
 	require.NoError(t, err)
 	chain := validChain(t, "gopher")
 	cache := NewVerifyCache(16)
-	acl := ACL{AllowOPAQuery: policy.WrapForTest(&query), OPAQueryTimeout: 10 * time.Second}.WithVerifyCache(cache)
+	acl := ACL{AllowOPAQuery: policytest.Wrap(&query), OPAQueryTimeout: 10 * time.Second}.WithVerifyCache(cache)
 	for i := 0; i < 2; i++ {
 		err := acl.VerifyPeerCertificateServer(chain.raw, chain.chains)
 		require.Error(t, err)
@@ -580,7 +580,7 @@ func BenchmarkVerifyPeerCertificateServer(b *testing.B) {
 		acl  ACL
 	}{
 		{"rules", ACL{AllowedCNs: []string{"someone", "else", "gopher"}}},
-		{"policy", ACL{AllowOPAQuery: policy.WrapForTest(prepareQuery(b, allowGopherPolicy)), OPAQueryTimeout: 10 * time.Second}},
+		{"policy", ACL{AllowOPAQuery: policytest.Wrap(prepareQuery(b, allowGopherPolicy)), OPAQueryTimeout: 10 * time.Second}},
 	} {
 		b.Run(tc.name+"/uncached", func(b *testing.B) {
 			b.ReportAllocs()
